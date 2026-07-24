@@ -184,6 +184,50 @@ class ValidateToolPairsTest(unittest.TestCase):
         self.assertEqual(result, [next_user])
         self.assertEqual(result[0]["role"], "user")
 
+    def test_mixed_content_leading_orphan_is_stripped_not_left_dangling(self):
+        """(b, follow-up) A leading message that MIXES an orphaned
+        tool_result with another block (e.g. text) must have only the
+        orphaned block removed, not be skipped entirely -- skipping it
+        leaves the orphaned tool_use_id reference in the request and
+        reproduces Anthropic's 400. The prefix and a deeper valid pair must
+        survive untouched."""
+        summary_msg, ack_msg = self._summary_prefix()
+        mixed_orphan = {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "gone", "content": "stale"},
+                {"type": "text", "text": "by the way, also..."},
+            ],
+        }
+        next_user = {"role": "user", "content": "let's continue"}
+        tool_call = {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "call_1", "name": "f", "input": {}},
+        ]}
+        tool_result = {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "call_1", "content": "42"},
+        ]}
+        messages = [summary_msg, ack_msg, mixed_orphan, next_user, tool_call, tool_result]
+
+        result = server._validate_tool_pairs(messages)
+
+        # Prefix untouched, at the required positions.
+        self.assertIs(result[0], summary_msg)
+        self.assertIs(result[1], ack_msg)
+        self.assertEqual(result[0]["role"], "user")
+        self.assertEqual(result[1]["role"], "assistant")
+
+        # The mixed message survives at position 2: orphan block gone, its
+        # other block (text) kept, message not dropped outright.
+        survived = result[2]
+        self.assertEqual(survived["role"], "user")
+        ids = [b.get("tool_use_id") for b in survived["content"] if b.get("type") == "tool_result"]
+        self.assertNotIn("gone", ids)
+        texts = [b.get("text") for b in survived["content"] if b.get("type") == "text"]
+        self.assertIn("by the way, also...", texts)
+
+        # Nothing deeper -- including the valid tool pair -- was disturbed.
+        self.assertEqual(result[3:], [next_user, tool_call, tool_result])
+
 
 class InjectionContractTest(unittest.TestCase):
     """(c) After both fixes: _has_summary is True on the merged array, the

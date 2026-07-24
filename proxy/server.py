@@ -373,17 +373,20 @@ def get_passthrough_headers(req_headers: dict) -> dict:
 
 
 def _validate_tool_pairs(messages: list) -> list:
-    """Drop a leading orphaned tool_result turn (its tool_use was cut away by
-    compression) without disturbing anything else.
+    """Drop leading orphaned tool_result references (their tool_use was cut
+    away by compression) without disturbing anything else.
 
     The old implementation scanned the WHOLE array for any orphaned
     tool_result and cut everything up to the last one it found — which could
     slice through the injected [summary, ack] prefix (breaking the
     SUMMARY_MARKER@[0]/ack@[1] contract) or discard valid, unrelated pairs
     deeper in the conversation. This version only ever trims a leading run:
-    an orphaned tool_result message, plus (if present) the dangling reply
-    that followed it, stopping at the next genuine user turn so the result
-    stays user-first.
+    a message consisting entirely of orphaned tool_result blocks is dropped
+    outright, along with (if present) the dangling reply that followed it; a
+    leading message that MIXES an orphaned tool_result with other blocks
+    (e.g. text) has only the orphaned block(s) stripped, keeping the rest of
+    the message in place. Either way this stops at the first surviving,
+    non-orphan message so the result stays user-first.
     """
     if not messages:
         return messages
@@ -394,11 +397,12 @@ def _validate_tool_pairs(messages: list) -> list:
     from compressor import SUMMARY_MARKER
     prefix_len = 0
     content0 = messages[0].get("content", "")
-    if (isinstance(content0, str) and SUMMARY_MARKER in content0
+    if (messages[0].get("role") == "user"
+            and isinstance(content0, str) and SUMMARY_MARKER in content0
             and len(messages) > 1 and messages[1].get("role") == "assistant"):
         prefix_len = 2
 
-    body = messages[prefix_len:]
+    body = list(messages[prefix_len:])
     if not body:
         return messages
 
@@ -411,23 +415,45 @@ def _validate_tool_pairs(messages: list) -> list:
                     known_ids.add(block.get("id", ""))
 
     def _is_orphan_tool_result(msg):
+        """Indices of `msg`'s tool_result blocks whose tool_use_id has no
+        matching tool_use in `known_ids` — empty if msg has none. A message
+        can mix an orphaned tool_result with unrelated blocks (e.g. text),
+        so this reports which blocks are orphaned rather than an all-or-
+        nothing verdict on the whole message."""
         content = msg.get("content", "")
-        blocks = [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
-        if not blocks or any(b.get("type") != "tool_result" for b in blocks):
-            return False
-        return any(b.get("tool_use_id", "") not in known_ids for b in blocks)
+        if not isinstance(content, list):
+            return []
+        return [
+            i for i, b in enumerate(content)
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+            and b.get("tool_use_id", "") not in known_ids
+        ]
 
     drop = 0
-    if _is_orphan_tool_result(body[0]):
-        drop = 1
-        # The message right after it replied to the tool_result we just
-        # dropped, so it's dangling too — keep advancing to the next real
-        # user turn to preserve alternation and user-first.
+    while drop < len(body):
+        orphan_idx = _is_orphan_tool_result(body[drop])
+        if not orphan_idx:
+            break  # clean, non-orphan message — stop trimming here
+
+        content = body[drop]["content"]
+        survivors = [b for i, b in enumerate(content) if i not in orphan_idx]
+        if survivors:
+            # Mixed content: strip only the orphaned tool_result block(s)
+            # and keep the message's other blocks in place. The message
+            # still opens with (or contains) live content, so alternation
+            # and the user-first guarantee both hold without dropping
+            # anything further.
+            body[drop] = {**body[drop], "content": survivors}
+            break
+
+        # The whole message was nothing but orphaned tool_result blocks —
+        # drop it and its now-dangling reply, then re-check what follows.
+        drop += 1
         while drop < len(body) and body[drop].get("role") != "user":
             drop += 1
 
     if drop:
-        log.info(f"Dropping {drop} messages with orphaned tool_result references")
+        log.info(f"Dropping {drop} leading messages with orphaned tool_result references")
 
     return messages[:prefix_len] + body[drop:]
 
