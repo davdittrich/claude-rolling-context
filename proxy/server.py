@@ -332,6 +332,39 @@ class CompressionStore:
         with self._lock:
             self._compressions = [e for e in self._compressions if e is not entry]
 
+    def promote_pending(self) -> int:
+        """Atomically promote every ready pending compression to live.
+
+        For each entry whose background write finished (pending is not None):
+        move pending -> prefix and pending_hashes -> original_hashes, then
+        clear both pending fields. The guard-read and the four field
+        assignments run together under self._lock, so two concurrent request
+        threads can't both pass the guard and race the transition — exactly one
+        promotes each entry and the entry can never be corrupted to
+        prefix=None/original_hashes=None (which find_match would drop, wasting
+        the billed background compression). Composes with the M1 write-order in
+        _do_background_compression (pending_hashes written before pending): the
+        promoter reads+clears both fields atomically here. Pure in-memory work,
+        no blocking call, so holding the lock is safe.
+
+        Returns the number of entries promoted (for logging/tests).
+        """
+        promoted = []
+        with self._lock:
+            for entry in self._compressions:
+                if entry["pending"] is not None:
+                    entry["prefix"] = entry["pending"]
+                    entry["original_hashes"] = entry["pending_hashes"]
+                    entry["pending"] = None
+                    entry["pending_hashes"] = None
+                    promoted.append(entry)
+        for entry in promoted:
+            log.info(
+                f"[MSG] Compression promoted: {len(entry['prefix'])} prefix messages "
+                f"replacing {len(entry['original_hashes'])} originals"
+            )
+        return len(promoted)
+
     @property
     def compressions(self):
         # Return a snapshot under the lock so readers (promote loop, health,
@@ -729,17 +762,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             f"messages={len(messages)} chars={msg_chars:,}"
         )
 
-        # Promote any pending compressions
-        for entry in store.compressions:
-            if entry["pending"] is not None:
-                entry["prefix"] = entry["pending"]
-                entry["original_hashes"] = entry["pending_hashes"]
-                entry["pending"] = None
-                entry["pending_hashes"] = None
-                log.info(
-                    f"[MSG] Compression promoted: {len(entry['prefix'])} prefix messages "
-                    f"replacing {len(entry['original_hashes'])} originals"
-                )
+        # Promote any pending compressions (atomic per-entry under the store
+        # lock — see CompressionStore.promote_pending).
+        store.promote_pending()
 
         # Scan: do any stored compressions match this request's messages?
         match, match_end = store.find_match(msg_hashes, messages)
@@ -749,17 +774,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # Replace everything up to match_end with the prefix
             # (prefix contains summary of everything before it)
             new_messages = messages[match_end:]
-
-            # Strip cache_control from injected prefix messages ONLY.
-            # The verbatim tail keeps Claude Code's cache_control breakpoints —
-            # stripping those disabled prompt caching entirely, so every request
-            # after the first injection paid full input-token cost (issue #1/#4).
-            for msg in match["prefix"]:
-                content = msg.get("content", "")
-                if isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict):
-                            block.pop("cache_control", None)
 
             merged = match["prefix"] + new_messages
             merged = _validate_tool_pairs(merged)
