@@ -253,17 +253,40 @@ class CompressionStore:
                             )
             return best, best_end
 
-    def add(self) -> dict:
-        entry = {
+    def _new_entry(self) -> dict:
+        return {
             "original_hashes": [],   # hashes of original messages we replaced
             "prefix": None,          # compressed replacement messages
             "pending": None,         # pending compression result
             "pending_hashes": None,  # hashes for pending
             "thread": None,          # background compression thread
+            "in_progress": False,    # reserved/running (set before thread start)
         }
+
+    def add(self) -> dict:
+        entry = self._new_entry()
         with self._lock:
             self._compressions.append(entry)
         return entry
+
+    def try_begin_compression(self):
+        """Atomically reserve a compression slot.
+
+        Under a single lock: refuse (return None) if any entry is already
+        in-progress; otherwise create the entry, mark it in-progress BEFORE
+        returning, and return it. Marking in_progress here — not after the
+        thread's start() — is what closes the race: a just-reserved entry is
+        visible to a concurrent caller even though its "thread" slot is still
+        None. The caller starts the thread and assigns entry["thread"] after.
+        """
+        with self._lock:
+            for e in self._compressions:
+                if e.get("in_progress"):
+                    return None
+            entry = self._new_entry()
+            entry["in_progress"] = True
+            self._compressions.append(entry)
+            return entry
 
     def remove(self, entry: dict):
         with self._lock:
@@ -271,7 +294,10 @@ class CompressionStore:
 
     @property
     def compressions(self):
-        return self._compressions
+        # Return a snapshot under the lock so readers (promote loop, health,
+        # debug) iterate a stable list even while other threads add/remove.
+        with self._lock:
+            return list(self._compressions)
 
 
 store = CompressionStore()
@@ -374,6 +400,11 @@ def _do_background_compression(entry: dict, messages: list, auth_headers: dict,
             exc_info=True,
         )
         entry["pending"] = None
+    finally:
+        # Release the reservation once work is done (success, failure, or the
+        # "nothing to compress" early return) so a later request can compress
+        # again. Cleared last so no duplicate can slip in while we were running.
+        entry["in_progress"] = False
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
@@ -755,32 +786,34 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # count keeps us from "compressing" sessions whose bulk is the
             # system prompt / first-message context, which we can't remove.
             if total_input > 0 and total_input > TRIGGER_TOKENS and len(current_messages) >= 6:
-                already_compressing = any(
-                    e["thread"] is not None and e["thread"].is_alive()
-                    for e in store.compressions
-                )
                 cooldown_left = FAILURE_COOLDOWN - (time.time() - _compression_failed_at)
-                if already_compressing:
-                    pass
-                elif cooldown_left > 0:
+                if cooldown_left > 0:
                     log.info(
                         f"[MSG] Over trigger but last compression failed — "
                         f"cooling down another {cooldown_left:.0f}s"
                     )
                 else:
-                    log.info(
-                        f"[MSG] API reported {total_input:,} tokens (trigger: {TRIGGER_TOKENS:,}). "
-                        f"Compressing in background..."
-                    )
-                    entry = store.add()
-                    t = threading.Thread(
-                        target=_do_background_compression,
-                        args=(entry, current_messages, auth_headers),
-                        kwargs={"real_token_count": total_input, "payload": payload},
-                        daemon=True,
-                    )
-                    t.start()
-                    entry["thread"] = t
+                    # Atomic check-add-reserve: returns None if a compression is
+                    # already in progress, so two concurrent over-trigger requests
+                    # cannot both spawn one (each spawn = a real upstream call).
+                    entry = store.try_begin_compression()
+                    if entry is None:
+                        pass  # already compressing
+                    else:
+                        log.info(
+                            f"[MSG] API reported {total_input:,} tokens (trigger: {TRIGGER_TOKENS:,}). "
+                            f"Compressing in background..."
+                        )
+                        t = threading.Thread(
+                            target=_do_background_compression,
+                            args=(entry, current_messages, auth_headers),
+                            kwargs={"real_token_count": total_input, "payload": payload},
+                            daemon=True,
+                        )
+                        # entry is already reserved (in_progress=True); assigning
+                        # the thread here just enriches diagnostics.
+                        t.start()
+                        entry["thread"] = t
 
         except Exception as e:
             log.error(f"[MSG] Upstream error: {e}", exc_info=True)
