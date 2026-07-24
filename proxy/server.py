@@ -15,6 +15,7 @@ Pure stdlib — no external dependencies needed.
 import hashlib
 import json
 import os
+import re
 import sys
 import logging
 import threading
@@ -24,7 +25,7 @@ import http.client
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
-from compressor import RollingCompressor
+from compressor import RollingCompressor, SUMMARY_MARKER, NATIVE_MODE, SUMMARIZER_FORMAT
 
 class FlushFileHandler(logging.FileHandler):
     def emit(self, record):
@@ -68,8 +69,8 @@ def _load_upstream() -> str:
         base = env_vars.get("ANTHROPIC_BASE_URL", "")
         if base and (urlparse(base).port or 0) != LISTEN_PORT:
             return base
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"[UPSTREAM] Failed to read {settings_path}: {e} — falling back to api.anthropic.com")
     return "https://api.anthropic.com"
 
 
@@ -145,8 +146,6 @@ def _upstream_conn():
 # ---------------------------------------------------------------------------
 # Content-based matching
 # ---------------------------------------------------------------------------
-
-import re
 
 _VOLATILE_TAGS_RE = re.compile(
     r"<(?:system-reminder|local-command-caveat|local-command-stdout|"
@@ -349,6 +348,12 @@ store = CompressionStore()
 # ---------------------------------------------------------------------------
 
 def _forward_headers(req_headers: dict, body: bytes = None, strip_encoding: bool = False) -> dict:
+    """Build headers for an outbound proxy request (raw pass-through and the
+    /v1/messages forward). NOT interchangeable with get_passthrough_headers:
+    this also strips "connection", recomputes "content-length" for a
+    (possibly rewritten) body, and can drop "accept-encoding" to force plain
+    SSE — none of which apply to the internal auth_headers snapshot that
+    get_passthrough_headers produces for later reuse by the compressor."""
     headers = {}
     for key, value in req_headers.items():
         lower = key.lower()
@@ -364,6 +369,8 @@ def _forward_headers(req_headers: dict, body: bytes = None, strip_encoding: bool
 
 
 def get_passthrough_headers(req_headers: dict) -> dict:
+    # Not a duplicate of _forward_headers: this keeps "connection" and never
+    # overrides "content-length" (see _forward_headers' docstring).
     headers = {}
     for key, value in req_headers.items():
         lower = key.lower()
@@ -394,7 +401,6 @@ def _validate_tool_pairs(messages: list) -> list:
     # The injected compression prefix is exactly [summary(user), ack(assistant)]
     # (see _do_background_compression) and never carries tool blocks — never
     # trim into it.
-    from compressor import SUMMARY_MARKER
     prefix_len = 0
     content0 = messages[0].get("content", "")
     if (messages[0].get("role") == "user"
@@ -487,7 +493,6 @@ def _do_background_compression(entry: dict, messages: list, auth_headers: dict,
         recent_count = len(compressed) - 2  # subtract summary + ack
         summarized = messages[:len(messages) - recent_count]
         # Skip old summary prefix if present
-        from compressor import SUMMARY_MARKER
         start = 0
         if summarized and isinstance(summarized[0].get("content", ""), str):
             if SUMMARY_MARKER in summarized[0]["content"]:
@@ -631,7 +636,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if entry["prefix"]:
                 for msg in entry["prefix"]:
                     content = msg.get("content", "")
-                    if isinstance(content, str) and "[ROLLING_CONTEXT_SUMMARY]" in content:
+                    if isinstance(content, str) and SUMMARY_MARKER in content:
                         info["prefix_content"] = content
             entries.append(info)
         body = json.dumps(entries, indent=2).encode()
@@ -666,7 +671,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
             1 for e in store.compressions
             if e["thread"] is not None and e["thread"].is_alive()
         )
-        from compressor import NATIVE_MODE, SUMMARIZER_FORMAT
         data = {
             "status": "ok",
             "trigger_tokens": TRIGGER_TOKENS,
@@ -963,7 +967,6 @@ class ThreadedHTTPServer(HTTPServer):
 
 
 def main():
-    from compressor import NATIVE_MODE, SUMMARIZER_FORMAT
     log.info(f"Starting Rolling Context Proxy on port {LISTEN_PORT}")
     log.info(f"  Trigger at: {TRIGGER_TOKENS:,} tokens")
     log.info(f"  Compress down to: {TARGET_TOKENS:,} tokens (recent context)")
