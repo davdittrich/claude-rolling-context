@@ -524,9 +524,26 @@ class RollingCompressor:
             raise RuntimeError(f"Summarization API returned {resp.status}: {error[:500]}")
         data = json.loads(resp_body)
 
+        def _empty_reply_error(detail: str) -> RuntimeError:
+            snippet = resp_body.decode("utf-8", errors="replace")[:300]
+            return RuntimeError(f"Summarization returned {detail}; response starts: {snippet}")
+
         if SUMMARIZER_FORMAT == "openai":
-            return data["choices"][0]["message"]["content"]
-        return data["content"][0]["text"]
+            choices = data.get("choices") or []
+            if not choices:
+                raise _empty_reply_error("no choices")
+            content = (choices[0].get("message") or {}).get("content")
+            if not isinstance(content, str) or not content.strip():
+                raise _empty_reply_error("empty text")
+            return content
+
+        content_blocks = data.get("content") or []
+        if not content_blocks:
+            raise _empty_reply_error("no content blocks")
+        text = content_blocks[0].get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise _empty_reply_error("empty text")
+        return text
 
     # ------------------------------------------------------------------
 
