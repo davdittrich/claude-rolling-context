@@ -709,8 +709,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 self.wfile.flush()
                 total_bytes += len(chunk)
-                if is_streaming:
-                    buffer += chunk
+                buffer += chunk
 
             log.info(f"[MSG] Done streaming {total_bytes:,} bytes")
 
