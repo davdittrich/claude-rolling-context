@@ -224,24 +224,26 @@ class RollingCompressor:
         if not boundaries:
             return 0
         # Walk boundaries newest -> oldest; extend while below the floor, or
-        # below the turn cap and still within the char budget.
+        # below the turn cap and still within the char budget. Sum only the
+        # newly included segment each step so every message is counted once.
         cut = boundaries[-1]
         turns_kept = 0
         accumulated = 0
+        prev = len(messages)
         for b in reversed(boundaries):
             if turns_kept < self.keep_floor or (
                 turns_kept < self.keep_turns and accumulated < target_chars
             ):
                 cut = b
-                accumulated = self._count_chars(messages[b:])
+                accumulated += self._count_chars(messages[b:prev])
+                prev = b
                 turns_kept += 1
             else:
                 break
         cut = min(cut, max_idx)
         if cut not in boundaries:
             # max_idx clipped into the last 4 msgs; snap to nearest clean boundary.
-            below = [b for b in boundaries if b <= max_idx]
-            cut = below[-1] if below else 0
+            cut = next((c for c in reversed(boundaries) if c <= max_idx), 0)
         return cut
 
     def _safe_cut(self, messages: list, cut: int, floor: int) -> int:
