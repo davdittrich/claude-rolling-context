@@ -717,11 +717,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if is_streaming and buffer:
                 try:
                     text = buffer.decode("utf-8", errors="replace")
-                    for line in text.split("\n"):
+                    lines = text.split("\n")
+                    sse_event_count = 0
+                    for line in lines:
                         if not line.startswith("data: "):
                             continue
+                        sse_event_count += 1
                         data_str = line[6:]
                         if data_str == "[DONE]":
+                            continue
+                        # Cheap pre-check: skip the (usually vast majority of)
+                        # content_block_delta/ping/etc. lines without paying
+                        # for a json.loads on each one.
+                        if "message_start" not in data_str and "message_delta" not in data_str:
                             continue
                         try:
                             data = json.loads(data_str)
@@ -748,12 +756,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                             if tokens > 0 and tokens > total_input:
                                 total_input = tokens
                                 log.info(f"[MSG] Input tokens from message_delta: {total_input:,}")
+                            # message_delta is the last usage-bearing event in
+                            # the stream — nothing after it can change total_input.
+                            break
 
                     if total_input == 0:
-                        sse_lines = [l for l in text.split("\n") if l.startswith("data: ")]
                         log.warning(
                             f"[MSG] No input tokens found in SSE! "
-                            f"Total events: {len(sse_lines)}"
+                            f"Total events: {sse_event_count}"
                         )
                 except Exception as e:
                     log.warning(f"[MSG] Failed to parse SSE for tokens: {e}")
