@@ -647,12 +647,19 @@ class RollingCompressor:
 
         compressed = [summary_message, ack_message] + recent_messages
 
+        # original_chars needs its own pass over `messages`. compressed_chars
+        # is additive over compress's two parts, so scan recent_messages once
+        # (recent_chars) and derive compressed_chars from it instead of
+        # re-scanning recent_messages a second time inside `compressed`.
         original_chars = self._count_chars(messages)
-        compressed_chars = self._count_chars(compressed)
-        summary_chars = len(new_summary)
         recent_chars = self._count_chars(recent_messages)
+        prefix_chars = self._count_chars([summary_message, ack_message])
+        compressed_chars = prefix_chars + recent_chars
+        summary_chars = len(new_summary)
         self.compression_count += 1
         if real_token_count:
+            # Real token count is known; reduction is an exact ratio of it,
+            # so estimated_output_tokens is a measured estimate, not a guess.
             reduction = compressed_chars / original_chars if original_chars > 0 else 0
             estimated_output_tokens = int(real_token_count * reduction)
             self.total_tokens_saved += real_token_count - estimated_output_tokens
@@ -663,7 +670,11 @@ class RollingCompressor:
                 f"summary={summary_chars:,} chars, recent={recent_chars:,} chars)"
             )
         else:
-            self.total_tokens_saved += (original_chars - compressed_chars) // 2
+            # No real token count available; estimate tokens saved from raw
+            # char delta using ~4 chars/token (English-text average for
+            # Claude's tokenizer) rather than the prior //2 (~2 chars/token),
+            # which over-reported savings by roughly 2x.
+            self.total_tokens_saved += (original_chars - compressed_chars) // 4
             log.info(
                 f"Compression #{self.compression_count}: "
                 f"{original_chars:,} -> {compressed_chars:,} chars "
