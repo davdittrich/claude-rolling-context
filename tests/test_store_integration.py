@@ -9,11 +9,21 @@ Two things are exercised:
 
 1. Store under concurrency (Gemini-e86.2 atomic reserve + Gemini-e86.6 cap/LRU
    eviction) WHILE a reader thread scans the same list via find_match:
-     - no exception / torn read escapes any thread,
+     - no exception escapes any thread,
      - in-progress / live-thread entries are NEVER evicted even at cap,
      - exactly ONE compression is reserved per trigger (no duplicate compression),
-     - find_match keeps returning the correct match throughout the churn.
+     - find_match keeps returning the correct match (right entry, right
+       match_end) while the store is heavily mutated concurrently.
    Determinism comes from threading.Barrier / Event, not sleeps.
+
+   Caveat, mutation-tested: the find_match sub-property does NOT prove
+   find_match's own `with self._lock:` is load-bearing — with that lock
+   deleted, test_find_match_correct_under_concurrent_mutation still passes
+   identically. The actual safety mechanism is CompressionStore.remove()
+   reassigning self._compressions to a NEW list object (copy-on-write)
+   rather than mutating in place, so any in-flight iteration over the old
+   list object sees a stable snapshot regardless of whether the reader
+   held the lock. See that test's docstring for detail.
 
 2. A promote->match->inject cycle driven at the Python level against the REAL
    CompressionStore and the REAL _hash_messages / find_match: seed a pending
@@ -154,15 +164,34 @@ class StoreConcurrencyEvictionTest(unittest.TestCase):
                       "in_progress entry was evicted under add storm")
         self.assertIn(pinned_thread_entry, snapshot,
                       "live-thread entry was evicted under add storm")
-        # Cap holds for evictable entries: total = the 2 pinned actives +
-        # at most `cap` evictable ones remaining (eviction only removes the
-        # inactive, and stops once at/under cap).
-        self.assertLessEqual(len(snapshot), cap + 2)
+        # Tight bound, not cap + active_count: add() is atomic under
+        # store._lock (append THEN _evict_locked in one acquisition), and the
+        # 2 pinned actives are < cap, so every single add() call evicts back
+        # to <= cap before releasing the lock (the just-appended entry is
+        # itself non-active and evictable, so the evict loop can always reach
+        # cap). By induction over every serialized add() call, the invariant
+        # len(_compressions) <= cap holds after each one — including the
+        # last, i.e. at snapshot time. Verified empirically over 30 runs at
+        # this exact bound (no cap+2 slack observed or required).
+        self.assertLessEqual(len(snapshot), cap)
 
     def test_find_match_correct_under_concurrent_mutation(self):
-        """Reader scanning _compressions via find_match sees no torn read and
-        keeps returning the correct match while writers churn the same list."""
-        cap = 6
+        """find_match returns the correct match (right entry, right match_end)
+        while a writer races add()/try_begin_compression()/remove() against
+        the same store, pre-seeded to a non-trivial size so every scan does
+        real work.
+
+        NOT a proof that find_match's own `with self._lock:` is load-bearing:
+        mutation-tested with that lock deleted, this test still passes
+        identically (see module docstring caveat). The safety relied on here
+        is CompressionStore.remove() reassigning self._compressions to a NEW
+        list object (copy-on-write) rather than mutating in place, so any
+        iteration already bound to the old list object — locked or not — sees
+        a stable snapshot. What this test verifies: find_match's matching
+        logic stays correct on every one of 500 scans under heavy, realistic
+        concurrent structural churn of a many-entry store.
+        """
+        cap = 64
         store = CompressionStore(max_entries=cap)
 
         chain_messages = [
@@ -174,6 +203,22 @@ class StoreConcurrencyEvictionTest(unittest.TestCase):
             {"role": "user", "content": "[summary of earlier turns]"},
             {"role": "assistant", "content": "acknowledged"},
         ]
+
+        # Decoys: dozens of non-matching entries (distinct hashes) so
+        # find_match scans a real list on every call instead of a list of
+        # one. cap is sized well above n_decoys + pinned + the writer's
+        # transient/leaked entries, so this seeding is never touched by
+        # eviction — this test is about matching correctness under churn,
+        # not eviction (that's test_active_entries_never_evicted_under_add_storm).
+        n_decoys = 40
+        for i in range(n_decoys):
+            decoy_chain = [
+                {"role": "user", "content": f"decoy question #{i}"},
+                {"role": "assistant", "content": f"decoy answer #{i}"},
+            ]
+            decoy_prefix = [{"role": "user", "content": f"[decoy summary #{i}]"}]
+            _seed_matchable(store, decoy_chain, decoy_prefix, active=False)
+
         # Pinned, active, matchable: must survive all eviction and always match.
         pinned = _seed_matchable(store, chain_messages, prefix, active=True)
 
@@ -190,7 +235,8 @@ class StoreConcurrencyEvictionTest(unittest.TestCase):
 
         # Reader runs a FIXED number of scans (deterministic overlap); the
         # writer churns the shared list continuously until the reader is done,
-        # so every scan races real concurrent mutation.
+        # so every scan races real concurrent mutation over the full,
+        # decoy-padded list.
         def reader():
             try:
                 start.wait()
@@ -198,7 +244,7 @@ class StoreConcurrencyEvictionTest(unittest.TestCase):
                     match, end = store.find_match(req_hashes, follow_up)
                     if match is not pinned or end != expected_end:
                         raise AssertionError(
-                            f"torn/incorrect match: match_is_pinned="
+                            f"incorrect match under churn: match_is_pinned="
                             f"{match is pinned} end={end} (want {expected_end})"
                         )
                     reader_iters[0] += 1
