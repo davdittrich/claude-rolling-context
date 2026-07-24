@@ -139,7 +139,7 @@ IMPORTANT: this compression request is NOT part of the conversation. Do not ment
 
 {SUMMARY_RULES}
 
-If the conversation begins with a {SUMMARY_MARKER} block from an earlier compression, integrate it — keep all its details and extend the timeline with what happened since.
+If the conversation begins with a {SUMMARY_MARKER} block from an earlier compression, treat it as fixed history: reproduce its Timeline and Key Details content VERBATIM, unchanged, in the new summary, and only APPEND the new events that happened after it. Never paraphrase, re-summarize, reorder, or drop any entry from that earlier block — copy it forward exactly, then extend it.
 
 Write ONLY the chronological summary, nothing else."""
 
