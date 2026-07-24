@@ -12,13 +12,15 @@ Invariants proven here:
 Run: python3 -m unittest discover -s tests
 """
 import importlib
-import json
 import os
 import sys
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "proxy"))
 import compressor  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(__file__))
+from _fakes import FakeSummarizerConn  # noqa: E402
 
 _ENV_KEYS = (
     "ROLLING_CONTEXT_SUMMARIZER_URL",
@@ -70,39 +72,12 @@ class NativeModePredicateTest(unittest.TestCase):
         self.assertFalse(mod.NATIVE_MODE)
 
 
-class _FakeResponse:
-    def __init__(self, body: bytes, status: int = 200):
-        self.status = status
-        self._body = body
-
-    def read(self):
-        return self._body
-
-
-class _FakeConn:
-    """Captures the outgoing request body instead of hitting the network."""
-
-    def __init__(self):
-        self.last_body = None
-
-    def request(self, method, path, body=None, headers=None):
-        self.last_body = json.loads(body)
-
-    def getresponse(self):
-        event = {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "summary"}}
-        sse = f"data: {json.dumps(event)}\n\n".encode()
-        return _FakeResponse(sse)
-
-    def close(self):
-        pass
-
-
 class SummarizeNativeModelTest(unittest.TestCase):
     """Exercises _summarize_native directly (network call stubbed out) to
     prove the request body's model always tracks payload["model"]."""
 
     def setUp(self):
-        self._fake_conn = _FakeConn()
+        self._fake_conn = FakeSummarizerConn(capture=True)
         self._real_conn_fn = compressor._summarizer_conn
         compressor._summarizer_conn = lambda timeout=600: self._fake_conn
 

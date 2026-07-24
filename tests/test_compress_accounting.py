@@ -14,7 +14,6 @@ Neither bug changes compression OUTPUT (cut point, summary, kept messages)
 
 Run: python3 -m unittest discover -s tests
 """
-import json
 import os
 import sys
 import unittest
@@ -22,36 +21,8 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "proxy"))
 import compressor  # noqa: E402
 
-
-class _FakeResponse:
-    def __init__(self, body: bytes, status: int = 200):
-        self.status = status
-        self._body = body
-
-    def read(self):
-        return self._body
-
-
-class _FakeConn:
-    """Captures nothing; returns a fixed mocked summary so native
-    summarization (default NATIVE_MODE) never hits the network."""
-
-    def __init__(self, reply_text: str):
-        self._reply_text = reply_text
-
-    def request(self, method, path, body=None, headers=None):
-        pass
-
-    def getresponse(self):
-        event = {
-            "type": "content_block_delta",
-            "delta": {"type": "text_delta", "text": self._reply_text},
-        }
-        sse = f"data: {json.dumps(event)}\n\n".encode()
-        return _FakeResponse(sse)
-
-    def close(self):
-        pass
+sys.path.insert(0, os.path.dirname(__file__))
+from _fakes import FakeSummarizerConn  # noqa: E402
 
 
 def _build_messages():
@@ -78,7 +49,7 @@ def _build_messages():
 class CompressAccountingTest(unittest.TestCase):
     def setUp(self):
         self._real_conn_fn = compressor._summarizer_conn
-        self._fake_conn = _FakeConn(reply_text="mocked deterministic summary text.")
+        self._fake_conn = FakeSummarizerConn(reply_text="mocked deterministic summary text.")
         compressor._summarizer_conn = lambda timeout=600: self._fake_conn
 
     def tearDown(self):

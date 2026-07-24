@@ -17,7 +17,6 @@ previously-stored compression still matches via CompressionStore.find_match.
 
 Run: python3 -m unittest discover -s tests
 """
-import json
 import os
 import sys
 import unittest
@@ -27,32 +26,8 @@ import compressor  # noqa: E402
 import server  # noqa: E402
 from compressor import NATIVE_COMPACT_PROMPT, SUMMARY_MARKER, SUMMARY_END_MARKER  # noqa: E402
 
-
-class _FakeResponse:
-    def __init__(self, body: bytes, status: int = 200):
-        self.status = status
-        self._body = body
-
-    def read(self):
-        return self._body
-
-
-class _FakeConn:
-    """Captures the outgoing request body instead of hitting the network."""
-
-    def __init__(self):
-        self.last_body = None
-
-    def request(self, method, path, body=None, headers=None):
-        self.last_body = json.loads(body)
-
-    def getresponse(self):
-        event = {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "summary"}}
-        sse = f"data: {json.dumps(event)}\n\n".encode()
-        return _FakeResponse(sse)
-
-    def close(self):
-        pass
+sys.path.insert(0, os.path.dirname(__file__))
+from _fakes import FakeSummarizerConn  # noqa: E402
 
 
 class NativeCompactPromptMergeTest(unittest.TestCase):
@@ -60,7 +35,7 @@ class NativeCompactPromptMergeTest(unittest.TestCase):
     message appended -- the compact instruction has to merge into it."""
 
     def setUp(self):
-        self._fake_conn = _FakeConn()
+        self._fake_conn = FakeSummarizerConn(capture=True)
         self._real_conn_fn = compressor._summarizer_conn
         compressor._summarizer_conn = lambda timeout=600: self._fake_conn
 

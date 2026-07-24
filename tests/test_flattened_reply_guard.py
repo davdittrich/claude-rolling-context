@@ -24,21 +24,15 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "proxy"))
 import compressor  # noqa: E402
 
+sys.path.insert(0, os.path.dirname(__file__))
+from _fakes import FakeResponse  # noqa: E402
+
 _ENV_KEYS = (
     "ROLLING_CONTEXT_SUMMARIZER_URL",
     "ROLLING_CONTEXT_SUMMARIZER_KEY",
     "ROLLING_CONTEXT_SUMMARIZER_FORMAT",
     "ROLLING_CONTEXT_MODEL",
 )
-
-
-class _FakeResponse:
-    def __init__(self, body: bytes, status: int = 200):
-        self.status = status
-        self._body = body
-
-    def read(self):
-        return self._body
 
 
 class _FakeConn:
@@ -51,7 +45,7 @@ class _FakeConn:
         pass
 
     def getresponse(self):
-        return _FakeResponse(self._body)
+        return FakeResponse(self._body)
 
     def close(self):
         pass

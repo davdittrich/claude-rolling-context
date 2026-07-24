@@ -15,64 +15,14 @@ local) that the parsed usage was used and the estimate fallback did not fire.
 
 Run: python3 -m unittest discover -s tests
 """
-import io
 import json
 import os
 import sys
 import unittest
-from email.message import Message
 from unittest.mock import patch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "proxy"))
-from server import ProxyHandler  # noqa: E402
-
-
-class FakeResponse:
-    def __init__(self, status, reason, headers, body):
-        self.status = status
-        self.reason = reason
-        self._headers = headers
-        self._body = body
-        self._pos = 0
-
-    def getheaders(self):
-        return self._headers
-
-    def read(self, n=8192):
-        chunk = self._body[self._pos:self._pos + n]
-        self._pos += len(chunk)
-        return chunk
-
-
-class FakeConn:
-    def __init__(self, response):
-        self._response = response
-
-    def request(self, *args, **kwargs):
-        pass
-
-    def getresponse(self):
-        return self._response
-
-    def close(self):
-        pass
-
-
-def _make_handler(body: bytes) -> ProxyHandler:
-    """Build a ProxyHandler without going through socketserver's __init__."""
-    handler = ProxyHandler.__new__(ProxyHandler)
-    handler.request_version = "HTTP/1.1"
-    handler.command = "POST"
-    handler.path = "/v1/messages"
-    handler.requestline = "POST /v1/messages HTTP/1.1"
-    handler.client_address = ("127.0.0.1", 0)
-
-    headers = Message()
-    headers["content-length"] = str(len(body))
-    handler.headers = headers
-    handler.rfile = io.BytesIO(body)
-    handler.wfile = io.BytesIO()
-    return handler
+sys.path.insert(0, os.path.dirname(__file__))
+from _fakes import FakeUpstreamConn, FakeUpstreamResponse, make_handler  # noqa: E402
 
 
 class NonStreamingUsageParseTest(unittest.TestCase):
@@ -82,7 +32,7 @@ class NonStreamingUsageParseTest(unittest.TestCase):
             "stream": False,
             "messages": [{"role": "user", "content": "hi"}],
         }).encode()
-        handler = _make_handler(request_body)
+        handler = make_handler(request_body)
 
         # Real usage the char estimate (2 chars // 4 == 0) would never produce.
         upstream_body = json.dumps({
@@ -97,13 +47,13 @@ class NonStreamingUsageParseTest(unittest.TestCase):
                 "output_tokens": 10,
             },
         }).encode()
-        fake_resp = FakeResponse(
+        fake_resp = FakeUpstreamResponse(
             200, "OK",
             [("content-type", "application/json"),
              ("content-length", str(len(upstream_body)))],
             upstream_body,
         )
-        fake_conn = FakeConn(fake_resp)
+        fake_conn = FakeUpstreamConn(fake_resp)
 
         with patch("server._upstream_conn", return_value=fake_conn):
             with self.assertLogs("rolling-context", level="INFO") as cm:
@@ -133,7 +83,7 @@ class NonStreamingUsageParseTest(unittest.TestCase):
             "stream": False,
             "messages": [{"role": "user", "content": "hello there, this needs enough chars"}],
         }).encode()
-        handler = _make_handler(request_body)
+        handler = make_handler(request_body)
 
         upstream_body = json.dumps({
             "id": "msg_2",
@@ -141,13 +91,13 @@ class NonStreamingUsageParseTest(unittest.TestCase):
             "role": "assistant",
             "content": [{"type": "text", "text": "hi"}],
         }).encode()
-        fake_resp = FakeResponse(
+        fake_resp = FakeUpstreamResponse(
             200, "OK",
             [("content-type", "application/json"),
              ("content-length", str(len(upstream_body)))],
             upstream_body,
         )
-        fake_conn = FakeConn(fake_resp)
+        fake_conn = FakeUpstreamConn(fake_resp)
 
         with patch("server._upstream_conn", return_value=fake_conn):
             with self.assertLogs("rolling-context", level="INFO") as cm:
