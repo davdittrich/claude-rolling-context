@@ -382,6 +382,7 @@ class RollingCompressor:
         # Place a cache breakpoint on the last conversation message (budget
         # permitting, max 4 per request) so the lookup reads the deepest
         # cache entry created by earlier chat requests.
+        privatized = False
         if convo and self._count_breakpoints(payload, convo) < 4:
             last = copy.deepcopy(convo[-1])
             c = last.get("content")
@@ -394,13 +395,17 @@ class RollingCompressor:
             elif isinstance(c, list) and c and isinstance(c[-1], dict):
                 c[-1]["cache_control"] = {"type": "ephemeral"}
             convo[-1] = last
+            privatized = True
 
         # Append the compact instruction. If the conversation already ends on
         # a user turn, merge it into that message's content instead of
         # appending a new user message — two consecutive user turns is a
-        # 400 from the API.
+        # 400 from the API. convo[-1] is only a private copy if the
+        # breakpoint block above ran (privatized); otherwise it is still the
+        # caller's own dict aliased in from `messages`, so it must still be
+        # deep-copied here rather than mutated in place.
         if convo and convo[-1].get("role") == "user":
-            merged_last = copy.deepcopy(convo[-1])
+            merged_last = convo[-1] if privatized else copy.deepcopy(convo[-1])
             content = merged_last.get("content", "")
             blocks = list(content) if isinstance(content, list) else (
                 [{"type": "text", "text": content}] if content else []
