@@ -90,6 +90,17 @@ class NativeCompactPromptMergeTest(unittest.TestCase):
         # the ternary in _summarize_native: preserve the existing block(s)
         # and append the compact instruction as one more block, rather than
         # appending a whole new user message.
+        #
+        # Note: this is not the only fixture shape that reaches
+        # `list(content)`. The cache-breakpoint step above the merge
+        # (~compressor.py:386-398) converts a plain-str convo[-1].content
+        # into a one-element list BEFORE the merge ternary runs, whenever
+        # `_count_breakpoints(...) < 4` -- so a str-content fixture (no
+        # pre-existing breakpoints) also hits `list(content)` here, not the
+        # str-wrapping else-arm. This test's value is exercising a fixture
+        # that is *already* list-shaped on input (proving the list arm
+        # handles pre-existing multi/typed blocks correctly), not proving
+        # some previously-unreached branch.
         comp = compressor.RollingCompressor()
         payload = {"model": "claude-sonnet-4-5-20250929"}
         messages = [
@@ -97,10 +108,11 @@ class NativeCompactPromptMergeTest(unittest.TestCase):
             {"role": "assistant", "content": "reply 1"},
             {"role": "user", "content": [{"type": "text", "text": "turn 2 block"}]},
         ]
-        # Prove the fixture reaches the list arm: convo[-1]'s content is
-        # already a list at the point _summarize_native receives it, so
-        # `isinstance(content, list)` is true and `list(content)` -- not the
-        # string-wrapping branch -- is what runs.
+        # Fixture's content is already a list going in, so the breakpoint
+        # step's `isinstance(c, list)` arm (stamp cache_control onto the
+        # last block) runs rather than its str-wrapping arm -- and the
+        # merge ternary's `isinstance(content, list)` is true, so
+        # `list(content)` is what runs there too.
         self.assertIsInstance(messages[-1]["content"], list)
 
         comp._summarize_native(payload, messages, cut=3, auth_headers={})
@@ -127,6 +139,68 @@ class NativeCompactPromptMergeTest(unittest.TestCase):
         self.assertEqual(last_content[0]["text"], "turn 2 block")
         self.assertEqual(
             last_content[1], {"type": "text", "text": NATIVE_COMPACT_PROMPT},
+        )
+
+    def test_str_content_with_breakpoints_exhausted_wraps_via_else_arm(self):
+        # The merge ternary's else arm --
+        # `[{"type": "text", "text": content}] if content else []` --
+        # only fires when content reaches the merge as a plain STR, which
+        # only happens when the breakpoint step above it (~compressor.py:
+        # 386-398) is SKIPPED. That step is guarded by
+        # `_count_breakpoints(...) < 4`, so pre-load 4 cache_control
+        # breakpoints onto payload["system"] (same setup as
+        # tests/test_native_dedup_copy.py's block-1-skipped fixture) to
+        # force the skip and keep convo[-1]'s str content untouched into
+        # the merge.
+        #
+        # Note: test_native_dedup_copy.py's
+        # test_block1_skipped_still_deep_copies_before_merging already
+        # exercises this same underlying code path (it targets the
+        # dedup-copy guarantee, not the merge arm); this test isolates and
+        # names it explicitly as else-arm coverage for this file's
+        # merge-arm suite, with an explicit pre-merge assertion that the
+        # breakpoint step was skipped.
+        comp = compressor.RollingCompressor()
+        payload = {
+            "model": "claude-sonnet-4-5-20250929",
+            "system": [
+                {"type": "text", "text": f"s{i}", "cache_control": {"type": "ephemeral"}}
+                for i in range(4)
+            ],
+        }
+        messages = [
+            {"role": "user", "content": "turn 1"},
+            {"role": "assistant", "content": "reply 1"},
+            {"role": "user", "content": "turn 2 str"},
+        ]
+        # Pre-merge: 4 breakpoints already present -> the guard
+        # `_count_breakpoints(...) < 4` is False, so the breakpoint step is
+        # skipped and convo[-1].content stays a plain str into the merge --
+        # provably hitting the else arm, not `list(content)`.
+        self.assertGreaterEqual(comp._count_breakpoints(payload, messages[:3]), 4)
+        self.assertIsInstance(messages[-1]["content"], str)
+
+        comp._summarize_native(payload, messages, cut=3, auth_headers={})
+
+        sent = self._fake_conn.last_body["messages"]
+        roles = [m["role"] for m in sent]
+        for i in range(1, len(roles)):
+            self.assertNotEqual(
+                roles[i], roles[i - 1],
+                f"consecutive same-role turns at {i - 1}/{i}: {roles}",
+            )
+        # No new user turn appended -- merged into the existing one.
+        self.assertEqual(len(sent), 3)
+        self.assertEqual(roles[-1], "user")
+
+        last_content = sent[-1]["content"]
+        self.assertIsInstance(last_content, list)
+        self.assertEqual(
+            last_content,
+            [
+                {"type": "text", "text": "turn 2 str"},
+                {"type": "text", "text": NATIVE_COMPACT_PROMPT},
+            ],
         )
 
 
