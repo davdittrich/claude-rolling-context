@@ -8,6 +8,8 @@ A transparent proxy that gives Claude Code **rolling context compression** — o
 
 **Zero config.** Uses your existing Claude Code auth. No API key needed. Just install and forget.
 
+> 🍴 **Fork** of [NodeNestor/claude-rolling-context](https://github.com/NodeNestor/claude-rolling-context) (MIT), substantially extended and maintained by [davdittrich](https://github.com/davdittrich/claude-rolling-context) — a turn-aware keep policy, concurrency hardening, correctness fixes, and a stdlib test suite. See [What this fork adds](#what-this-fork-adds).
+
 > Claude Code's built-in `/compact` replaces your **entire** conversation with a lossy summary. After a few compactions, you're summarizing a summary of a summary. This plugin only compresses old messages — recent context stays untouched.
 
 It's also a cost story: every token you carry in context gets re-billed on **every turn** (at cache-read rates), so an unmanaged session's input cost grows with the *square* of its length. Capping the prefix makes it linear — [the math](#the-economics-why-capping-the-prefix-matters) works in relative units and holds for every model, and it matters more the bigger the context window, not less.
@@ -73,6 +75,19 @@ Instead of replacing everything, this plugin:
 4. **Never blocks** — compression runs in the background, applied on the next request
 5. **Full transcripts preserved** — Claude Code still saves everything to JSONL in `~/.claude/projects/`
 
+## What this fork adds
+
+This fork keeps the upstream design (transparent proxy, rolling summary, verbatim recent tail, zero deps) and adds:
+
+- **Turn-aware blend keep policy** — instead of a flat token budget, the verbatim tail is chosen by *whole recent turns* (`ROLLING_CONTEXT_KEEP_TURNS` / `ROLLING_CONTEXT_KEEP_FLOOR`) clamped by the `TARGET` token ceiling. A mid-task tool chain is never split, and a single giant tool dump can't evict the surrounding reasoning. On real long-session telemetry this cut carried-tail cost while holding the working set.
+- **Concurrency hardening** — compression reservations are atomic (parallel Claude Code requests can no longer trigger duplicate, billed summarizer calls), the pending→active promotion runs under the store lock, and completed results publish their match hashes before the guard flag so a finished compression is never dropped.
+- **Bounded, non-leaking store** — the compression store is capped and LRU-evicts inactive entries (`ROLLING_CONTEXT_STORE_MAX`), and it no longer pins compressed-away message history in memory by default (`ROLLING_CONTEXT_DEBUG_MESSAGES`).
+- **Correctness fixes** — non-streaming (`stream:false`) responses now parse real token usage; SSE usage parsing only touches the two events that carry it; a foreign `ROLLING_CONTEXT_MODEL` correctly switches to flattened mode (no silent prompt-cache miss); malformed/empty summarizer replies raise instead of injecting a `"None"` summary; message-shape guards prevent consecutive-user-turn and orphaned-`tool_result` 400s; native re-summarization carries the prior timeline forward verbatim.
+- **A stdlib test suite** — 68 `unittest` cases, no pip deps:
+  ```bash
+  python3 -m unittest discover -s tests
+  ```
+
 ## Install
 
 ### Option 1: Claude Code Plugin (recommended)
@@ -80,7 +95,7 @@ Instead of replacing everything, this plugin:
 Run these two commands inside Claude Code:
 
 ```
-/plugin marketplace add https://github.com/NodeNestor/nestor-plugins
+/plugin marketplace add https://github.com/davdittrich/claude-rolling-context
 /plugin install rolling-context
 ```
 
@@ -90,14 +105,14 @@ Restart your terminal and start a new Claude Code session. On the **first start*
 
 **Linux / macOS:**
 ```bash
-git clone https://github.com/NodeNestor/claude-rolling-context.git ~/claude-rolling-context
+git clone https://github.com/davdittrich/claude-rolling-context.git ~/claude-rolling-context
 cd ~/claude-rolling-context
 bash install.sh
 ```
 
 **Windows (PowerShell):**
 ```powershell
-git clone https://github.com/NodeNestor/claude-rolling-context.git $HOME\claude-rolling-context
+git clone https://github.com/davdittrich/claude-rolling-context.git $HOME\claude-rolling-context
 cd $HOME\claude-rolling-context
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
@@ -245,10 +260,12 @@ cd $HOME\claude-rolling-context; powershell -ExecutionPolicy Bypass -File uninst
 
 If you installed via marketplace and already deleted the repo, you can run it from the cache:
 ```powershell
-cd $HOME\.claude\plugins\cache\rolling-context-marketplace\rolling-context\<version>
+cd $HOME\.claude\plugins\marketplaces\rolling-context
 powershell -ExecutionPolicy Bypass -File uninstall.ps1
 ```
 
-## License
+## Credits & License
 
-MIT
+Originally created by [NodeNestor](https://github.com/NodeNestor/claude-rolling-context). This fork is substantially extended and maintained by [davdittrich](https://github.com/davdittrich/claude-rolling-context) — see [What this fork adds](#what-this-fork-adds).
+
+MIT — © 2026 NodeNestor (original), © 2026 davdittrich (fork modifications). See [LICENSE](LICENSE).

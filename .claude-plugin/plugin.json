@@ -1,9 +1,9 @@
 {
   "name": "rolling-context",
-  "version": "1.9.0",
-  "description": "Rolling context compression - old messages get summarized, recent messages stay verbatim. Never hit the context wall.",
+  "version": "2.0.0",
+  "description": "Rolling context compression - old messages get summarized, recent messages stay verbatim. Never hit the context wall. Turn-aware keep policy + concurrency hardening (davdittrich fork).",
   "author": {
-    "name": "NodeNestor"
+    "name": "davdittrich"
   },
-  "homepage": "https://github.com/NodeNestor/claude-rolling-context"
+  "homepage": "https://github.com/davdittrich/claude-rolling-context"
 }

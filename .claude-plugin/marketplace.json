@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "rolling-context",
+  "description": "Rolling context compression for Claude Code — old messages get summarized, recent messages stay verbatim. Turn-aware keep policy + concurrency hardening.",
+  "owner": {
+    "name": "Dennis Dittrich",
+    "url": "https://github.com/davdittrich"
+  },
+  "plugins": [
+    {
+      "name": "rolling-context",
+      "description": "Transparent proxy giving Claude Code rolling context compression with a turn-aware verbatim keep policy. Zero deps, uses your existing Claude Code auth.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}
