@@ -159,12 +159,19 @@ class RollingCompressor:
         trigger_tokens: int = 80000,
         target_tokens: int = 40000,
         summarizer_model: str = "",
+        keep_turns: int = 8,
+        keep_floor: int = 3,
     ):
         self.trigger_tokens = trigger_tokens
         self.target_tokens = target_tokens
         # Empty = native mode uses the session's own model (prompt-cache hit);
         # flattened mode falls back to LEGACY_DEFAULT_MODEL.
         self.summarizer_model = summarizer_model
+        # Blend keep policy: keep between keep_floor and keep_turns recent
+        # user-turns verbatim, with target_tokens as the soft char ceiling.
+        # Clamp to guarantee 1 <= keep_floor <= keep_turns despite misconfig.
+        self.keep_turns = max(1, keep_turns)
+        self.keep_floor = max(1, min(keep_floor, self.keep_turns))
         self.compression_count = 0
         self.total_tokens_saved = 0
 
@@ -193,23 +200,49 @@ class RollingCompressor:
         return total_chars
 
     def _find_keep_index(self, messages: list, keep_ratio: float) -> int:
-        """Find the cut point: keep the last keep_ratio fraction of content."""
+        """Blend cut point: keep between keep_floor and keep_turns recent
+        user-turns verbatim, with target chars (keep_ratio * total) as the soft
+        upper ceiling that keep_floor may override.
+
+        The returned index already satisfies both _safe_cut preconditions
+        (clean user start AND clean predecessor), so _safe_cut is a no-op and
+        the keep_turns cap cannot be exceeded by compress()'s later _safe_cut.
+        """
         if len(messages) <= 4:
             return 0
         max_idx = len(messages) - 4
         total_chars = self._count_chars(messages)
         target_chars = int(total_chars * keep_ratio)
+        # Boundaries that are BOTH a clean user start (no tool_result) AND have
+        # a clean predecessor (no dangling tool_use) -> a _safe_cut no-op.
+        boundaries = [
+            i for i in range(len(messages))
+            if messages[i].get("role") == "user"
+            and not self._has_tool_result(messages[i])
+            and (i == 0 or not self._has_tool_use(messages[i - 1]))
+        ]
+        if not boundaries:
+            return 0
+        # Walk boundaries newest -> oldest; extend while below the floor, or
+        # below the turn cap and still within the char budget.
+        cut = boundaries[-1]
+        turns_kept = 0
         accumulated = 0
-        for i in range(len(messages) - 1, -1, -1):
-            msg_chars = self._count_chars([messages[i]])
-            if accumulated + msg_chars > target_chars:
-                for j in range(i + 1, len(messages)):
-                    if messages[j].get("role") == "user":
-                        if not self._has_tool_result(messages[j]):
-                            return min(j, max_idx)
-                return min(i + 1, max_idx)
-            accumulated += msg_chars
-        return 0
+        for b in reversed(boundaries):
+            if turns_kept < self.keep_floor or (
+                turns_kept < self.keep_turns and accumulated < target_chars
+            ):
+                cut = b
+                accumulated = self._count_chars(messages[b:])
+                turns_kept += 1
+            else:
+                break
+        cut = min(cut, max_idx)
+        if cut not in boundaries:
+            # max_idx clipped into the last 4 msgs; snap to nearest clean boundary.
+            below = [b for b in boundaries if b <= max_idx]
+            cut = below[-1] if below else 0
+        return cut
 
     def _safe_cut(self, messages: list, cut: int, floor: int) -> int:
         """Walk cut back to a boundary where messages[cut:] is a valid start.

@@ -59,14 +59,15 @@ Claude Code  ──►  Rolling Context Proxy (:5588)  ──►  Anthropic API
                               1. summarize old messages in the background
                                  (native mode: your session's own model,
                                   served almost entirely from prompt cache)
-                              2. keep ~40K tokens of recent messages verbatim
+                              2. keep the last 3-8 recent user-turns verbatim
+                                 (whole turns, capped at ~40K tokens)
                               3. inject compressed context on next request
                               4. never blocks, never adds latency
 ```
 
 Instead of replacing everything, this plugin:
 
-1. **Keeps recent messages untouched** — recent context stays verbatim
+1. **Keeps recent messages untouched** — the last 3-8 recent user-turns stay verbatim (whole turns, so a mid-task tool chain is never split), capped at the `TARGET` token budget. The turn window is tunable via `ROLLING_CONTEXT_KEEP_TURNS` / `ROLLING_CONTEXT_KEEP_FLOOR`
 2. **Only compresses when needed** — triggers at 100K (real API token count), compresses old messages, grows naturally until next trigger
 3. **Merges summaries** — each compression cycle merges with the previous summary, building a rolling timeline
 4. **Never blocks** — compression runs in the background, applied on the next request
