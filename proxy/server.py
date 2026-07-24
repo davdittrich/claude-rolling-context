@@ -86,6 +86,17 @@ SUMMARIZER_MODEL = os.environ.get("ROLLING_CONTEXT_MODEL") or ""
 # After a failed compression, wait this long before trying again — otherwise a
 # failing summarizer (e.g. rate-limited) gets re-hammered on every request.
 FAILURE_COOLDOWN = int(os.environ.get("ROLLING_CONTEXT_FAILURE_COOLDOWN") or "300")
+# Cap on stored compression entries — without a bound, entries accumulate
+# forever (removed only on "nothing to compress" / "no longer helps"),
+# leaking memory and making find_match()'s scan O(entries) on every request.
+STORE_MAX = int(os.environ.get("ROLLING_CONTEXT_STORE_MAX") or "32")
+# entry["_debug_messages"] pins the whole compressed-away original message
+# list for mismatch debugging. Off by default (unbounded retention would
+# leak memory); when enabled, still capped to the most recent N messages.
+DEBUG_MESSAGES_ENABLED = (os.environ.get("ROLLING_CONTEXT_DEBUG_MESSAGES") or "").strip().lower() in (
+    "1", "true", "yes",
+)
+DEBUG_MESSAGES_CAP = 50
 
 ssl_ctx = ssl.create_default_context()
 _parsed_upstream = urlparse(UPSTREAM_URL)
@@ -197,9 +208,10 @@ class CompressionStore:
     match a stored compression, replaces them with the prefix.
     """
 
-    def __init__(self):
+    def __init__(self, max_entries: int = None):
         self._lock = threading.Lock()
-        self._compressions = []  # list of compression entries
+        self._compressions = []  # list of compression entries, oldest first
+        self._max_entries = STORE_MAX if max_entries is None else max_entries
 
     def find_match(self, msg_hashes: list, messages: list = None):
         """Find a compression whose hash chain appears in msg_hashes.
@@ -261,12 +273,40 @@ class CompressionStore:
             "pending_hashes": None,  # hashes for pending
             "thread": None,          # background compression thread
             "in_progress": False,    # reserved/running (set before thread start)
+            "_debug_messages": None,  # optional mismatch-debug retention (see DEBUG_MESSAGES_ENABLED)
         }
+
+    @staticmethod
+    def _is_active(entry: dict) -> bool:
+        """True if evicting this entry could pull the rug out from under a
+        running (or about-to-run) background compression."""
+        if entry.get("in_progress"):
+            return True
+        thread = entry.get("thread")
+        return thread is not None and thread.is_alive()
+
+    def _evict_locked(self):
+        """Evict oldest non-active entries until at/under cap.
+
+        Caller must hold self._lock. Never evicts an in-progress entry or one
+        with a live compression thread — if every entry is active, the store
+        stays over cap rather than dropping live state (correctness over the
+        soft cap).
+        """
+        while len(self._compressions) > self._max_entries:
+            idx = next(
+                (i for i, e in enumerate(self._compressions) if not self._is_active(e)),
+                None,
+            )
+            if idx is None:
+                break
+            del self._compressions[idx]
 
     def add(self) -> dict:
         entry = self._new_entry()
         with self._lock:
             self._compressions.append(entry)
+            self._evict_locked()
         return entry
 
     def try_begin_compression(self):
@@ -286,6 +326,7 @@ class CompressionStore:
             entry = self._new_entry()
             entry["in_progress"] = True
             self._compressions.append(entry)
+            self._evict_locked()  # entry is in_progress, so this can't evict it
             return entry
 
     def remove(self, entry: dict):
@@ -386,7 +427,10 @@ def _do_background_compression(entry: dict, messages: list, auth_headers: dict,
         key_hashes = _hash_messages(summarized[start:])
         entry["pending"] = prefix
         entry["pending_hashes"] = key_hashes
-        entry["_debug_messages"] = summarized[start:]  # for mismatch debugging
+        if DEBUG_MESSAGES_ENABLED:
+            # For mismatch debugging only — capped so an opted-in debug run
+            # still can't pin an unbounded amount of message history.
+            entry["_debug_messages"] = summarized[start:][-DEBUG_MESSAGES_CAP:]
         log.info(
             f"[BG] Compression ready: "
             f"{compressor._count_chars(prefix):,} chars "

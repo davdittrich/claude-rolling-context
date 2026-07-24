@@ -194,6 +194,8 @@ All settings via environment variables (all optional — defaults work great):
 | `ROLLING_CONTEXT_SUMMARIZER_KEY` | *(uses Claude Code auth)* | API key for custom summarizer endpoint |
 | `ROLLING_CONTEXT_SUMMARIZER_FORMAT` | `anthropic` | `openai` = /v1/chat/completions for OpenAI-compatible endpoints |
 | `ROLLING_CONTEXT_FAILURE_COOLDOWN` | `300` | Seconds to wait before retrying after a failed compression |
+| `ROLLING_CONTEXT_STORE_MAX` | `32` | Max stored compression entries; oldest non-active entry is evicted on insert once over cap |
+| `ROLLING_CONTEXT_DEBUG_MESSAGES` | *(off)* | Set `1`/`true` to retain the compressed-away original messages per entry (capped, for mismatch debugging) — off by default to avoid pinning message history in memory |
 
 ## Proxy Chaining
 
@@ -224,7 +226,7 @@ Returns compression stats: how many compressions, tokens saved, etc.
 curl http://127.0.0.1:5588/debug/compressions
 ```
 
-Returns the stored compression entries with their full summary content — useful for verifying what the rolling summary captured and whether user goals/instructions survived compression.
+Returns the stored compression entries with their full summary content — useful for verifying what the rolling summary captured and whether user goals/instructions survived compression. The store is capped at `ROLLING_CONTEXT_STORE_MAX` entries (oldest evicted first); per-entry retention of the original compressed-away messages is off by default (`ROLLING_CONTEXT_DEBUG_MESSAGES`).
 
 ## Uninstall
 
