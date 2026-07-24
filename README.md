@@ -175,6 +175,7 @@ This means:
 - **Multiple conversations work automatically** — each conversation has unique content, unique hashes, no collision
 - **Subagents and branches just work** — the proxy doesn't care about sessions, only content
 - **No state to corrupt** — restart the proxy anytime, worst case is one extra compression cycle
+- **Concurrent-safe and bounded** — compression reservations are atomic, so parallel requests can't trigger duplicate summarizer calls, and the store is capped (`ROLLING_CONTEXT_STORE_MAX`, oldest non-active entry evicted) so it never grows without bound
 - **Claude Code sees nothing different** — the proxy is invisible, JSONL transcripts are unmodified
 
 ## Configuration

@@ -498,8 +498,13 @@ def _do_background_compression(entry: dict, messages: list, auth_headers: dict,
             if SUMMARY_MARKER in summarized[0]["content"]:
                 start = 2
         key_hashes = _hash_messages(summarized[start:])
-        entry["pending"] = prefix
+        # Publish ordering: the promote loop (a different, unlocked request
+        # thread) guards on "pending" and then reads "pending_hashes", so write
+        # pending_hashes FIRST and the guard field "pending" LAST. Otherwise an
+        # interleave could promote pending with pending_hashes still None, which
+        # sets original_hashes=None and the compression never matches (wasted).
         entry["pending_hashes"] = key_hashes
+        entry["pending"] = prefix
         if DEBUG_MESSAGES_ENABLED:
             # For mismatch debugging only — capped so an opted-in debug run
             # still can't pin an unbounded amount of message history.
