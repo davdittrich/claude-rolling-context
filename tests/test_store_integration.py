@@ -33,10 +33,14 @@ Two things are exercised:
    original messages.
 
 docker-compose.e2e.yml at the repo root was preferred but is not runnable in
-this environment: docker is unavailable AND its referenced build context
-(test/Dockerfile.e2e) does not exist. The Python-level integration test below
-is the sanctioned fallback (drives the real store), and is strictly
-deterministic.
+this environment: docker itself is unavailable here. Its build context
+(test/Dockerfile.e2e, test/entrypoint.sh) now exists and is correct-by-
+construction, but is UNBUILT and UNVERIFIED — the image was never built or
+run in this environment (see the Dockerfile's own header comment). Also
+note docker-compose.e2e.yml's credentials volume uses ${USERPROFILE}, a
+Windows-only env var (Linux/macOS use $HOME) — pre-existing in the compose
+file, not fixed here. The Python-level integration test below is the
+sanctioned fallback (drives the real store), and is strictly deterministic.
 
 Run: python3 -m unittest discover -s tests
 """

@@ -4,4 +4,6 @@ __pycache__/
 *.pyc
 *.egg-info/
 .env
-test/
+test/*
+!test/Dockerfile.e2e
+!test/entrypoint.sh
