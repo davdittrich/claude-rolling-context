@@ -833,8 +833,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             log.info(f"[MSG] Streaming response...")
 
-            # Stream response and capture SSE token data
-            buffer = b""
+            # Stream response and capture SSE token data. bytearray so the
+            # per-chunk accumulation is an in-place O(n) extend, not the O(n^2)
+            # realloc-and-copy of `bytes += bytes` (runs for every response now
+            # that non-streaming bodies are buffered too).
+            buffer = bytearray()
             total_bytes = 0
             total_input = 0
             while True:
