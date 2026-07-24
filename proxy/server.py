@@ -76,6 +76,10 @@ def _load_upstream() -> str:
 UPSTREAM_URL = _load_upstream()
 TRIGGER_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TRIGGER") or "100000")
 TARGET_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TARGET") or "40000")
+# Blend keep policy: keep between KEEP_FLOOR and KEEP_TURNS recent user-turns
+# verbatim (whole turns), capped at TARGET tokens. Clamped in RollingCompressor.
+KEEP_TURNS = int(os.environ.get("ROLLING_CONTEXT_KEEP_TURNS") or "8")
+KEEP_FLOOR = int(os.environ.get("ROLLING_CONTEXT_KEEP_FLOOR") or "3")
 # Empty = native mode compresses with the session's own model (prompt-cache
 # hit); set to pin a specific summarizer model.
 SUMMARIZER_MODEL = os.environ.get("ROLLING_CONTEXT_MODEL") or ""
@@ -105,6 +109,8 @@ compressor = RollingCompressor(
     trigger_tokens=TRIGGER_TOKENS,
     target_tokens=TARGET_TOKENS,
     summarizer_model=SUMMARIZER_MODEL,
+    keep_turns=KEEP_TURNS,
+    keep_floor=KEEP_FLOOR,
 )
 
 
@@ -522,6 +528,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "status": "ok",
             "trigger_tokens": TRIGGER_TOKENS,
             "target_tokens": TARGET_TOKENS,
+            "keep_turns": compressor.keep_turns,
+            "keep_floor": compressor.keep_floor,
             "summarizer_model": SUMMARIZER_MODEL or "(session model)",
             "summarizer_mode": "native" if NATIVE_MODE else f"flattened/{SUMMARIZER_FORMAT}",
             "upstream_url": UPSTREAM_URL,
@@ -805,6 +813,7 @@ def main():
     log.info(f"Starting Rolling Context Proxy on port {LISTEN_PORT}")
     log.info(f"  Trigger at: {TRIGGER_TOKENS:,} tokens")
     log.info(f"  Compress down to: {TARGET_TOKENS:,} tokens (recent context)")
+    log.info(f"  Keep recent turns: {compressor.keep_floor}..{compressor.keep_turns} user-turns")
     log.info(f"  Summarizer model: {SUMMARIZER_MODEL or '(session model)'}")
     log.info(f"  Summarizer mode: "
              f"{'native (cloned session request, prompt-cached)' if NATIVE_MODE else f'flattened/{SUMMARIZER_FORMAT}'}")

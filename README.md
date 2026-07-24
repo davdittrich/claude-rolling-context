@@ -184,7 +184,9 @@ All settings via environment variables (all optional — defaults work great):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ROLLING_CONTEXT_TRIGGER` | `100000` | Compress when context exceeds this many tokens |
-| `ROLLING_CONTEXT_TARGET` | `40000` | Keep this many tokens of recent messages after compression |
+| `ROLLING_CONTEXT_TARGET` | `40000` | Soft token ceiling for the recent messages kept after compression |
+| `ROLLING_CONTEXT_KEEP_TURNS` | `8` | Max recent user-turns kept verbatim after compression |
+| `ROLLING_CONTEXT_KEEP_FLOOR` | `3` | Min recent user-turns always kept, even when one turn exceeds `TARGET` |
 | `ROLLING_CONTEXT_MODEL` | *(session model)* | Summarizer model; unset = the session's own model (prompt-cache hit) |
 | `ROLLING_CONTEXT_PORT` | `5588` | Proxy listen port |
 | `ROLLING_CONTEXT_UPSTREAM` | `https://api.anthropic.com` | Upstream API URL (chain to another proxy!) |
