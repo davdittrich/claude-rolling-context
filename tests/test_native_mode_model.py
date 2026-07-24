@@ -103,5 +103,65 @@ class SummarizeNativeModelTest(unittest.TestCase):
         self.assertEqual(self._fake_conn.last_body["model"], compressor.LEGACY_DEFAULT_MODEL)
 
 
+class SingleSourceModelTest(unittest.TestCase):
+    """Proves ROLLING_CONTEXT_MODEL has exactly one reader (compressor):
+    server.py must import SUMMARIZER_MODEL rather than re-reading the env
+    itself, so server and compressor can never drift on the resolved value."""
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in _ENV_KEYS}
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        importlib.reload(compressor)
+        import server
+        importlib.reload(server)
+
+    def _reload_both(self, **env):
+        for k in _ENV_KEYS:
+            os.environ.pop(k, None)
+        os.environ.update(env)
+        importlib.reload(compressor)
+        import server
+        importlib.reload(server)
+        return compressor, server
+
+    def test_server_and_compressor_agree_when_model_set(self):
+        comp, srv = self._reload_both(ROLLING_CONTEXT_MODEL="claude-opus-4-1-20250805")
+        self.assertEqual(comp.SUMMARIZER_MODEL, "claude-opus-4-1-20250805")
+        self.assertEqual(srv.SUMMARIZER_MODEL, comp.SUMMARIZER_MODEL)
+        self.assertEqual(srv.compressor.summarizer_model, comp.SUMMARIZER_MODEL)
+        self.assertFalse(comp.NATIVE_MODE)
+        self.assertFalse(srv.NATIVE_MODE)
+
+    def test_server_and_compressor_agree_when_model_unset(self):
+        comp, srv = self._reload_both()
+        self.assertEqual(comp.SUMMARIZER_MODEL, "")
+        self.assertEqual(srv.SUMMARIZER_MODEL, comp.SUMMARIZER_MODEL)
+        self.assertEqual(srv.compressor.summarizer_model, comp.SUMMARIZER_MODEL)
+        self.assertTrue(comp.NATIVE_MODE)
+        self.assertTrue(srv.NATIVE_MODE)
+
+    def test_only_compressor_reads_the_env_var(self):
+        # Code-structure guard for the DoD: exactly one
+        # os.environ.get("ROLLING_CONTEXT_MODEL") in the whole proxy package,
+        # and it lives in compressor.py (the single owner).
+        needle = 'os.environ.get("ROLLING_CONTEXT_MODEL")'
+        proxy_dir = os.path.join(os.path.dirname(__file__), "..", "proxy")
+        hits = []
+        for fname in sorted(os.listdir(proxy_dir)):
+            if not fname.endswith(".py"):
+                continue
+            path = os.path.join(proxy_dir, fname)
+            with open(path, encoding="utf-8") as f:
+                count = f.read().count(needle)
+            hits.extend([fname] * count)
+        self.assertEqual(hits, ["compressor.py"])
+
+
 if __name__ == "__main__":
     unittest.main()

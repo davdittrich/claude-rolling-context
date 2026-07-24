@@ -25,7 +25,7 @@ import http.client
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
-from compressor import RollingCompressor, SUMMARY_MARKER, NATIVE_MODE, SUMMARIZER_FORMAT
+from compressor import RollingCompressor, SUMMARY_MARKER, NATIVE_MODE, SUMMARIZER_FORMAT, SUMMARIZER_MODEL
 
 class FlushFileHandler(logging.FileHandler):
     def emit(self, record):
@@ -81,9 +81,6 @@ TARGET_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TARGET") or "40000")
 # verbatim (whole turns), capped at TARGET tokens. Clamped in RollingCompressor.
 KEEP_TURNS = int(os.environ.get("ROLLING_CONTEXT_KEEP_TURNS") or "8")
 KEEP_FLOOR = int(os.environ.get("ROLLING_CONTEXT_KEEP_FLOOR") or "3")
-# Empty = native mode compresses with the session's own model (prompt-cache
-# hit); set to pin a specific summarizer model.
-SUMMARIZER_MODEL = os.environ.get("ROLLING_CONTEXT_MODEL") or ""
 # After a failed compression, wait this long before trying again — otherwise a
 # failing summarizer (e.g. rate-limited) gets re-hammered on every request.
 FAILURE_COOLDOWN = int(os.environ.get("ROLLING_CONTEXT_FAILURE_COOLDOWN") or "300")

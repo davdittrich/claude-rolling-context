@@ -45,7 +45,8 @@ SUMMARIZER_FORMAT = (os.environ.get("ROLLING_CONTEXT_SUMMARIZER_FORMAT") or "ant
 # the session's own model, so it hits Anthropic's prompt cache. Pinning a
 # different model guarantees a cache MISS, so treat it the same as a custom
 # summarizer and fall back to a standalone flattened request.
-MODEL_SET = bool(os.environ.get("ROLLING_CONTEXT_MODEL"))
+SUMMARIZER_MODEL = os.environ.get("ROLLING_CONTEXT_MODEL") or ""
+MODEL_SET = bool(SUMMARIZER_MODEL)
 NATIVE_MODE = not (SUMMARIZER_URL_SET or SUMMARIZER_API_KEY or SUMMARIZER_FORMAT != "anthropic" or MODEL_SET)
 LEGACY_DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 
