@@ -234,7 +234,9 @@ class InjectionContractTest(unittest.TestCase):
         old_hashes = server._hash_messages(old_messages)
 
         store = server.CompressionStore()
-        entry = store.add()
+        entry = store._new_entry()
+        with store._lock:
+            store._compressions.append(entry)
         entry["prefix"] = prefix
         entry["original_hashes"] = old_hashes
 

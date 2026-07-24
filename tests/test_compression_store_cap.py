@@ -1,12 +1,15 @@
 """CompressionStore bound: cap + LRU eviction, and _debug_messages retention gating.
 
 Two failure modes this proves:
-1. Unbounded growth — CompressionStore.add()/try_begin_compression() appended
+1. Unbounded growth — CompressionStore.try_begin_compression() appended
    entries forever; only removed on "nothing to compress" or "no longer
    helps". Stale entries whose hashes never recur pinned memory + made every
    find_match() scan O(entries) forever. Fix: cap entries (env
    ROLLING_CONTEXT_STORE_MAX, default 32), evicting the oldest entry on
-   insert once over cap.
+   insert once over cap. (Tests here drive that same append+evict primitive
+   via the seed_evictable() test helper, since production's only other
+   entry-creation path -- try_begin_compression() -- refuses to run while an
+   in_progress entry is pinned, which several of these tests require.)
 2. Unbounded retention per entry — entry["_debug_messages"] pinned the WHOLE
    compressed-away original message list forever, for every entry, by
    default. Fix: gate behind ROLLING_CONTEXT_DEBUG_MESSAGES (default off)
@@ -29,14 +32,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "proxy"))
 import server  # noqa: E402
 from server import CompressionStore  # noqa: E402
 
+sys.path.insert(0, os.path.dirname(__file__))
+from _fakes import seed_evictable  # noqa: E402
+
 
 class StoreCapTest(unittest.TestCase):
-    def test_cap_enforced_on_add(self):
-        store = CompressionStore(max_entries=5)
-        for _ in range(10):
-            store.add()
-        self.assertLessEqual(len(store.compressions), 5)
-
     def test_cap_enforced_on_try_begin_compression(self):
         store = CompressionStore(max_entries=2)
         for _ in range(4):
@@ -47,10 +47,10 @@ class StoreCapTest(unittest.TestCase):
 
     def test_oldest_evicted_first(self):
         store = CompressionStore(max_entries=3)
-        entries = [store.add() for _ in range(3)]
+        entries = [seed_evictable(store) for _ in range(3)]
         for i, e in enumerate(entries):
             e["_marker"] = i  # tag insertion order for identification
-        store.add()  # 4th insert should push the store over cap by one
+        seed_evictable(store)  # 4th insert should push the store over cap by one
         remaining = [e.get("_marker") for e in store.compressions if "_marker" in e]
         self.assertNotIn(0, remaining, "oldest entry (marker 0) should have been evicted")
         self.assertIn(1, remaining)
@@ -61,7 +61,7 @@ class StoreCapTest(unittest.TestCase):
         active = store.try_begin_compression()  # oldest entry, still reserved
         self.assertIsNotNone(active)
         for _ in range(5):
-            store.add()
+            seed_evictable(store)
         self.assertIn(active, store.compressions)
 
     def test_live_thread_entry_never_evicted(self):
@@ -82,7 +82,7 @@ class StoreCapTest(unittest.TestCase):
         entry["in_progress"] = False
         try:
             for _ in range(5):
-                store.add()
+                seed_evictable(store)
             self.assertIn(entry, store.compressions)
         finally:
             release.set()

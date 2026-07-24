@@ -45,7 +45,9 @@ class PromotePendingRaceTest(unittest.TestCase):
         n = 32
         rounds = 50
         store = CompressionStore()
-        entry = store.add()
+        entry = store._new_entry()
+        with store._lock:
+            store._compressions.append(entry)
 
         sentinel_prefix = [
             {"role": "user", "content": "SUMMARY"},

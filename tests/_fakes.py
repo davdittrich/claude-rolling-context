@@ -10,8 +10,9 @@ reply text, request-body capture on/off).
 tests/test_flattened_reply_guard.py keeps its own JSON-reply conn local (its
 response shape is JSON, not SSE) but imports FakeResponse from here.
 
-Gemini-e86.18. Room is intentionally left in this module for e86.16's
-`seed_evictable(store)` store helper to be appended alongside these.
+Gemini-e86.18. Also carries e86.16's `seed_evictable(store)` store helper
+(appended below), which replicates the deleted CompressionStore.add()'s
+append+evict primitive for the eviction/cap tests.
 
 Run: python3 -m unittest discover -s tests
 """
@@ -98,6 +99,20 @@ class FakeUpstreamConn:
 
     def close(self):
         pass
+
+
+def seed_evictable(store):
+    """Append a fresh, evictable (in_progress=False) entry under store._lock
+    and run eviction, replicating the deleted CompressionStore.add()'s
+    append+evict primitive. Unlike try_begin_compression(), this does NOT
+    refuse when another entry is already in_progress -- it is the only way
+    to apply eviction pressure while an in_progress entry is pinned, which
+    is exactly what the eviction/cap tests need."""
+    with store._lock:
+        entry = store._new_entry()
+        store._compressions.append(entry)
+        store._evict_locked()
+    return entry
 
 
 def make_handler(body: bytes) -> ProxyHandler:

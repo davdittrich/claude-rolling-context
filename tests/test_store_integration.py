@@ -49,13 +49,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "proxy"))
 import server  # noqa: E402
 from server import CompressionStore, _hash_messages  # noqa: E402
 
+sys.path.insert(0, os.path.dirname(__file__))
+from _fakes import seed_evictable  # noqa: E402
+
 
 def _seed_matchable(store, chain_messages, prefix, active=False):
     """Insert an entry that find_match WILL match: real hashes + a prefix.
 
     active=True marks it in_progress so eviction must skip it (Gemini-e86.6
-    invariant). Bypasses add()/try_begin_compression() because those create
-    empty entries; we need original_hashes populated to be matchable.
+    invariant). Bypasses try_begin_compression() (creates an empty entry)
+    and seed_evictable() (also empty); we need original_hashes populated to
+    be matchable, so this builds and appends the entry directly.
     """
     entry = store._new_entry()
     entry["original_hashes"] = _hash_messages(chain_messages)
@@ -113,7 +117,12 @@ class StoreConcurrencyEvictionTest(unittest.TestCase):
             store.remove(winner)
 
     def test_active_entries_never_evicted_under_add_storm(self):
-        """Cap-forcing add() storm must not evict in_progress / live-thread entries."""
+        """Cap-forcing seed_evictable() storm must not evict in_progress /
+        live-thread entries. Uses seed_evictable() (not try_begin_compression())
+        because pinned_in_progress below makes try_begin_compression() refuse
+        for every writer thread; seed_evictable() replicates the deleted
+        CompressionStore.add()'s append+evict primitive, which applies
+        eviction pressure unconditionally."""
         cap = 4
         store = CompressionStore(max_entries=cap)
         release = threading.Event()
@@ -144,7 +153,7 @@ class StoreConcurrencyEvictionTest(unittest.TestCase):
             try:
                 barrier.wait()
                 for _ in range(adds_each):
-                    store.add()
+                    seed_evictable(store)
             except Exception as exc:  # noqa: BLE001
                 errors.append(exc)
 
@@ -164,12 +173,13 @@ class StoreConcurrencyEvictionTest(unittest.TestCase):
                       "in_progress entry was evicted under add storm")
         self.assertIn(pinned_thread_entry, snapshot,
                       "live-thread entry was evicted under add storm")
-        # Tight bound, not cap + active_count: add() is atomic under
-        # store._lock (append THEN _evict_locked in one acquisition), and the
-        # 2 pinned actives are < cap, so every single add() call evicts back
-        # to <= cap before releasing the lock (the just-appended entry is
-        # itself non-active and evictable, so the evict loop can always reach
-        # cap). By induction over every serialized add() call, the invariant
+        # Tight bound, not cap + active_count: seed_evictable() is atomic
+        # under store._lock (append THEN _evict_locked in one acquisition),
+        # and the 2 pinned actives are < cap, so every single
+        # seed_evictable() call evicts back to <= cap before releasing the
+        # lock (the just-appended entry is itself non-active and evictable,
+        # so the evict loop can always reach cap). By induction over every
+        # serialized seed_evictable() call, the invariant
         # len(_compressions) <= cap holds after each one — including the
         # last, i.e. at snapshot time. Verified empirically over 30 runs at
         # this exact bound (no cap+2 slack observed or required).
@@ -177,9 +187,9 @@ class StoreConcurrencyEvictionTest(unittest.TestCase):
 
     def test_find_match_correct_under_concurrent_mutation(self):
         """find_match returns the correct match (right entry, right match_end)
-        while a writer races add()/try_begin_compression()/remove() against
-        the same store, pre-seeded to a non-trivial size so every scan does
-        real work.
+        while a writer races seed_evictable()/try_begin_compression()/remove()
+        against the same store, pre-seeded to a non-trivial size so every scan
+        does real work.
 
         NOT a proof that find_match's own `with self._lock:` is load-bearing:
         mutation-tested with that lock deleted, this test still passes
@@ -257,7 +267,7 @@ class StoreConcurrencyEvictionTest(unittest.TestCase):
             try:
                 start.wait()
                 while not stop.is_set():
-                    e = store.add()
+                    e = seed_evictable(store)
                     store.try_begin_compression()
                     store.remove(e)
             except Exception as exc:  # noqa: BLE001
@@ -298,7 +308,9 @@ class PromoteMatchInjectTest(unittest.TestCase):
 
         # 1. A background compression finished: it left pending + pending_hashes,
         #    exactly as _do_background_compression does before promotion.
-        entry = store.add()
+        entry = store._new_entry()
+        with store._lock:
+            store._compressions.append(entry)
         entry["pending"] = list(prefix)
         entry["pending_hashes"] = _hash_messages(original_messages)
 

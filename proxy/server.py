@@ -301,13 +301,6 @@ class CompressionStore:
                 break
             del self._compressions[idx]
 
-    def add(self) -> dict:
-        entry = self._new_entry()
-        with self._lock:
-            self._compressions.append(entry)
-            self._evict_locked()
-        return entry
-
     def try_begin_compression(self):
         """Atomically reserve a compression slot.
 
