@@ -84,6 +84,51 @@ class NativeCompactPromptMergeTest(unittest.TestCase):
         self.assertEqual(sent[-1]["role"], "user")
         self.assertEqual(sent[-1]["content"], NATIVE_COMPACT_PROMPT)
 
+    def test_list_content_ending_convo_merges_into_existing_blocks(self):
+        # (c) When the trailing user turn's content is ALREADY a list of
+        # blocks (not a plain string), the merge must take the list arm of
+        # the ternary in _summarize_native: preserve the existing block(s)
+        # and append the compact instruction as one more block, rather than
+        # appending a whole new user message.
+        comp = compressor.RollingCompressor()
+        payload = {"model": "claude-sonnet-4-5-20250929"}
+        messages = [
+            {"role": "user", "content": "turn 1"},
+            {"role": "assistant", "content": "reply 1"},
+            {"role": "user", "content": [{"type": "text", "text": "turn 2 block"}]},
+        ]
+        # Prove the fixture reaches the list arm: convo[-1]'s content is
+        # already a list at the point _summarize_native receives it, so
+        # `isinstance(content, list)` is true and `list(content)` -- not the
+        # string-wrapping branch -- is what runs.
+        self.assertIsInstance(messages[-1]["content"], list)
+
+        comp._summarize_native(payload, messages, cut=3, auth_headers={})
+
+        sent = self._fake_conn.last_body["messages"]
+        roles = [m["role"] for m in sent]
+        for i in range(1, len(roles)):
+            self.assertNotEqual(
+                roles[i], roles[i - 1],
+                f"consecutive same-role turns at {i - 1}/{i}: {roles}",
+            )
+        # Merged into the existing turn -- no new message appended.
+        self.assertEqual(len(sent), 3)
+        self.assertEqual(roles[-1], "user")
+
+        last_content = sent[-1]["content"]
+        self.assertIsInstance(last_content, list)
+        # Original block preserved (a cache_control breakpoint may be
+        # stamped onto it earlier in _summarize_native -- that is a
+        # separate, already-covered concern, so only type/text are pinned
+        # here) plus exactly one appended compact-instruction block.
+        self.assertEqual(len(last_content), 2)
+        self.assertEqual(last_content[0]["type"], "text")
+        self.assertEqual(last_content[0]["text"], "turn 2 block")
+        self.assertEqual(
+            last_content[1], {"type": "text", "text": NATIVE_COMPACT_PROMPT},
+        )
+
 
 class ValidateToolPairsTest(unittest.TestCase):
     """(b) Only a leading orphaned tool_result turn (plus its dangling
