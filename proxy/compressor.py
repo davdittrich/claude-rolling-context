@@ -658,8 +658,10 @@ class RollingCompressor:
         summary_chars = len(new_summary)
         self.compression_count += 1
         if real_token_count:
-            # Real token count is known; reduction is an exact ratio of it,
-            # so estimated_output_tokens is a measured estimate, not a guess.
+            # Real token count is known, but reduction is only a char-based
+            # ratio (compressed/original chars), not a token-based one, so
+            # estimated_output_tokens is an ESTIMATE derived from that ratio,
+            # not an exact token count.
             reduction = compressed_chars / original_chars if original_chars > 0 else 0
             estimated_output_tokens = int(real_token_count * reduction)
             self.total_tokens_saved += real_token_count - estimated_output_tokens
