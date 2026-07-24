@@ -40,8 +40,13 @@ SUMMARIZER_BASE_URL = os.environ.get("ROLLING_CONTEXT_SUMMARIZER_URL") or _defau
 SUMMARIZER_API_KEY = os.environ.get("ROLLING_CONTEXT_SUMMARIZER_KEY") or ""
 # "anthropic" (default) or "openai" — openai speaks /v1/chat/completions
 SUMMARIZER_FORMAT = (os.environ.get("ROLLING_CONTEXT_SUMMARIZER_FORMAT") or "anthropic").lower()
-# Any custom summarizer config switches off native mode
-NATIVE_MODE = not (SUMMARIZER_URL_SET or SUMMARIZER_API_KEY or SUMMARIZER_FORMAT != "anthropic")
+# A pinned summarizer model or any custom summarizer config switches off
+# native mode: native mode's whole value is that the cloned request reuses
+# the session's own model, so it hits Anthropic's prompt cache. Pinning a
+# different model guarantees a cache MISS, so treat it the same as a custom
+# summarizer and fall back to a standalone flattened request.
+MODEL_SET = bool(os.environ.get("ROLLING_CONTEXT_MODEL"))
+NATIVE_MODE = not (SUMMARIZER_URL_SET or SUMMARIZER_API_KEY or SUMMARIZER_FORMAT != "anthropic" or MODEL_SET)
 LEGACY_DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 
 ssl_ctx = ssl.create_default_context()
@@ -164,8 +169,10 @@ class RollingCompressor:
     ):
         self.trigger_tokens = trigger_tokens
         self.target_tokens = target_tokens
-        # Empty = native mode uses the session's own model (prompt-cache hit);
-        # flattened mode falls back to LEGACY_DEFAULT_MODEL.
+        # Only used by flattened mode: native mode always uses the session's
+        # own payload["model"] (that's what makes it a prompt-cache hit).
+        # Setting ROLLING_CONTEXT_MODEL switches NATIVE_MODE off, so
+        # summarizer_model and native mode are mutually exclusive by design.
         self.summarizer_model = summarizer_model
         # Blend keep policy: keep between keep_floor and keep_turns recent
         # user-turns verbatim, with target_tokens as the soft char ceiling.
@@ -387,7 +394,7 @@ class RollingCompressor:
                 c[-1]["cache_control"] = {"type": "ephemeral"}
             convo[-1] = last
 
-        model = self.summarizer_model or payload.get("model", LEGACY_DEFAULT_MODEL)
+        model = payload.get("model", LEGACY_DEFAULT_MODEL)
         max_tokens = 16000
         body = {
             "model": model,

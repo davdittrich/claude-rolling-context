@@ -141,7 +141,7 @@ By default the proxy doesn't build a separate summarization request. It **clones
 - **It's a prompt-cache read.** The cloned prefix was just sent by the chat request, so the API serves it from cache. Measured in practice: a ~72K-token compression request cost ~400 fresh input tokens.
 - **It's genuine Claude Code session traffic.** Pro/Max subscription OAuth tokens are classified server-side — standalone requests that don't look like Claude Code get routed to the overage lane and rejected with 429. The cloned request passes because it *is* the session's own request shape.
 
-Setting `ROLLING_CONTEXT_MODEL` pins a different summarizer model (the request shape stays native, but a different model means no prompt-cache reuse). Configuring any `ROLLING_CONTEXT_SUMMARIZER_*` variable switches to a standalone flattened request instead — see below.
+Setting `ROLLING_CONTEXT_MODEL` pins a different summarizer model. Since a different model can't reuse the session's prompt cache anyway, this switches native mode off and sends a standalone flattened request to that model instead — same as configuring any `ROLLING_CONTEXT_SUMMARIZER_*` variable. Leave `ROLLING_CONTEXT_MODEL` unset to stay in native mode and compress with the session's own model — see below.
 
 ### Using any API or a local model for compression
 
@@ -187,7 +187,7 @@ All settings via environment variables (all optional — defaults work great):
 | `ROLLING_CONTEXT_TARGET` | `40000` | Soft token ceiling for the recent messages kept after compression |
 | `ROLLING_CONTEXT_KEEP_TURNS` | `8` | Max recent user-turns kept verbatim after compression |
 | `ROLLING_CONTEXT_KEEP_FLOOR` | `3` | Min recent user-turns always kept, even when one turn exceeds `TARGET` |
-| `ROLLING_CONTEXT_MODEL` | *(session model)* | Summarizer model; unset = the session's own model (prompt-cache hit) |
+| `ROLLING_CONTEXT_MODEL` | *(session model, native)* | Summarizer model; unset = native mode, session's own model (prompt-cache hit); set = forces flattened mode to this model |
 | `ROLLING_CONTEXT_PORT` | `5588` | Proxy listen port |
 | `ROLLING_CONTEXT_UPSTREAM` | `https://api.anthropic.com` | Upstream API URL (chain to another proxy!) |
 | `ROLLING_CONTEXT_SUMMARIZER_URL` | *(upstream)* | Custom endpoint for summarization (local model, other API) |
