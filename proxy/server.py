@@ -373,21 +373,63 @@ def get_passthrough_headers(req_headers: dict) -> dict:
 
 
 def _validate_tool_pairs(messages: list) -> list:
-    tool_use_ids = set()
-    valid_from = 0
-    for i, msg in enumerate(messages):
+    """Drop a leading orphaned tool_result turn (its tool_use was cut away by
+    compression) without disturbing anything else.
+
+    The old implementation scanned the WHOLE array for any orphaned
+    tool_result and cut everything up to the last one it found — which could
+    slice through the injected [summary, ack] prefix (breaking the
+    SUMMARY_MARKER@[0]/ack@[1] contract) or discard valid, unrelated pairs
+    deeper in the conversation. This version only ever trims a leading run:
+    an orphaned tool_result message, plus (if present) the dangling reply
+    that followed it, stopping at the next genuine user turn so the result
+    stays user-first.
+    """
+    if not messages:
+        return messages
+
+    # The injected compression prefix is exactly [summary(user), ack(assistant)]
+    # (see _do_background_compression) and never carries tool blocks — never
+    # trim into it.
+    from compressor import SUMMARY_MARKER
+    prefix_len = 0
+    content0 = messages[0].get("content", "")
+    if (isinstance(content0, str) and SUMMARY_MARKER in content0
+            and len(messages) > 1 and messages[1].get("role") == "assistant"):
+        prefix_len = 2
+
+    body = messages[prefix_len:]
+    if not body:
+        return messages
+
+    known_ids = set()
+    for msg in body:
         content = msg.get("content", "")
         if isinstance(content, list):
             for block in content:
-                if isinstance(block, dict):
-                    if block.get("type") == "tool_use":
-                        tool_use_ids.add(block.get("id", ""))
-                    elif block.get("type") == "tool_result":
-                        if block.get("tool_use_id", "") not in tool_use_ids:
-                            valid_from = i + 1
-    if valid_from > 0:
-        log.info(f"Dropping {valid_from} messages with orphaned tool_result references")
-    return messages[valid_from:]
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    known_ids.add(block.get("id", ""))
+
+    def _is_orphan_tool_result(msg):
+        content = msg.get("content", "")
+        blocks = [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+        if not blocks or any(b.get("type") != "tool_result" for b in blocks):
+            return False
+        return any(b.get("tool_use_id", "") not in known_ids for b in blocks)
+
+    drop = 0
+    if _is_orphan_tool_result(body[0]):
+        drop = 1
+        # The message right after it replied to the tool_result we just
+        # dropped, so it's dangling too — keep advancing to the next real
+        # user turn to preserve alternation and user-first.
+        while drop < len(body) and body[drop].get("role") != "user":
+            drop += 1
+
+    if drop:
+        log.info(f"Dropping {drop} messages with orphaned tool_result references")
+
+    return messages[:prefix_len] + body[drop:]
 
 
 _compression_failed_at = 0.0

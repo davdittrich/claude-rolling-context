@@ -394,13 +394,30 @@ class RollingCompressor:
                 c[-1]["cache_control"] = {"type": "ephemeral"}
             convo[-1] = last
 
+        # Append the compact instruction. If the conversation already ends on
+        # a user turn, merge it into that message's content instead of
+        # appending a new user message — two consecutive user turns is a
+        # 400 from the API.
+        if convo and convo[-1].get("role") == "user":
+            merged_last = copy.deepcopy(convo[-1])
+            content = merged_last.get("content", "")
+            blocks = list(content) if isinstance(content, list) else (
+                [{"type": "text", "text": content}] if content else []
+            )
+            blocks.append({"type": "text", "text": NATIVE_COMPACT_PROMPT})
+            merged_last["content"] = blocks
+            convo[-1] = merged_last
+            compact_messages = convo
+        else:
+            compact_messages = convo + [{"role": "user", "content": NATIVE_COMPACT_PROMPT}]
+
         model = payload.get("model", LEGACY_DEFAULT_MODEL)
         max_tokens = 16000
         body = {
             "model": model,
             "max_tokens": max_tokens,
             "stream": True,
-            "messages": convo + [{"role": "user", "content": NATIVE_COMPACT_PROMPT}],
+            "messages": compact_messages,
         }
         for key in ("system", "tools", "metadata"):
             if payload.get(key) is not None:
