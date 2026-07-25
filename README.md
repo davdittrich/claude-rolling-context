@@ -12,7 +12,7 @@ A transparent proxy that gives Claude Code **rolling context compression** — o
 
 > Claude Code's built-in `/compact` replaces your **entire** conversation with a lossy summary. After a few compactions, you're summarizing a summary of a summary. This plugin only compresses old messages — recent context stays untouched.
 
-**This is a retention tool, not a cost-saver.** Claude Code's built-in `/compact` already caps the prefix, so the cost problem is handled in the box. Measured against `/compact` **at the same auto-compact threshold**, this proxy always costs **more**, not less — about +23% at its 100K default (from +6% at lax triggers to +47% aggressive) ([the economics](#the-economics-capping-the-prefix-and-what-it-costs) shows why and how much). What you get for that premium is the recent conversation kept **verbatim** instead of discarded. If your goal is to spend less, use `/compact`. If your goal is aggressive compression that doesn't lose the session, use this.
+**This is a retention tool, not a cost-saver.** Claude Code's built-in `/compact` already caps the prefix, so the cost problem is handled in the box. Measured against `/compact` **at the same auto-compact threshold**, this proxy always costs **more**, not less — about +23% at its 100K default (from +6% at lax triggers to +47% aggressive) ([the economics](#the-economics-capping-the-prefix-and-what-it-costs) shows why and how much). What you get for that premium is the recent conversation kept **verbatim** instead of discarded. If your goal is to spend less, use `/compact`. If your goal is aggressive compression that doesn't lose the session, use this. Not sure? [Should you use this?](#should-you-use-this) has the honest call.
 
 ## `/compact` vs Rolling Context
 
@@ -50,6 +50,28 @@ Claude Code re-sends the entire conversation on every turn. Even with caching wo
 **On Pro/Max subscriptions** none of this is dollars — it's rate-limit budget, and the honest headline is that the proxy burns **more** of your window than native `/compact` at any matched threshold (~+23% at the 100K default), because it carries the tail and compacts more often. The one lever that could close the gap — summarizing on a cheaper model like Haiku — needs either a separate API key or a flattened request that the subscription-OAuth classifier rejects (the reason native mode exists). So on a subscription there is no way to make this cost-neutral. Run it for retention, not to stretch the window.
 
 > **Honest note:** if cost were the *only* goal, this is the wrong tool — native `/compact` (optionally at a lower `CLAUDE_CODE_AUTO_COMPACT_WINDOW`) is **cheaper**, because it keeps no verbatim tail. What it can't buy is quality under repetition: built-in compaction replaces the whole conversation with a lossy summary every time it fires — at a low threshold it fires often, and you're soon working from a summary of a summary of a summary. The rolling design exists so aggressive compression doesn't cost you the session: recent work stays verbatim, and old work lives in one continuously-merged timeline instead of N generations of loss. You pay a small premium for that.
+
+## Should you use this?
+
+At a matched auto-compact threshold this proxy always costs **more** than the built-in `/compact` ([the economics](#the-economics-capping-the-prefix-and-what-it-costs)). So the question isn't whether it's cheaper. It's whether you need what the premium buys: the recent conversation kept **verbatim** under aggressive compression.
+
+**Use it when:**
+- You run genuinely long sessions (regularly past 100K). Under that, it does nothing.
+- You compact early *and* need the recent working set exact — the code you just read, the exact error, the file you're editing. Native `/compact` can't give you that; it summarizes everything.
+- You'll accept ~+23% over native (at a matched 100K trigger) for that retention.
+- **API-key users:** you point summarization at a cheaper model (`ROLLING_CONTEXT_MODEL=claude-haiku-4-5`) and validate quality; the one path to cost-neutral *with* a verbatim tail.
+
+**Avoid it when:**
+- Cost or rate-limit budget is your binding constraint. Native `/compact` (optionally at a lower threshold) is cheaper, and on a subscription the cheaper-summarizer escape is blocked. Spend less by using `/compact`.
+- Your work stays under ~100K. Nothing to compress.
+- You depend on server-side prompt-cache preservation or native Context Editing — the proxy rewrites client-side and invalidates the cache; they fight.
+
+**One-line verdicts:**
+- **Subscription, want to spend less** → no. Use `/compact`.
+- **Subscription, want recent detail kept exact under heavy compression** → yes, at a ~+23% rate-limit premium.
+- **API-key, budget-conscious** → maybe: a Haiku summarizer can be cost-neutral-to-cheaper, but validate the summaries.
+
+Full evidence, and the pin-proxy/raise-native tail case where the proxy does come out ahead, are in the [design brief](docs/design-brief.md) §5–§6.
 
 ## How It Works
 

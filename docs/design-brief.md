@@ -6,7 +6,7 @@
 
 ## The one-paragraph version
 
-Claude Code re-sends your **entire** conversation to the API on every turn, and as a session grows that prefix gets re-billed turn after turn. The built-in `/compact` already fixes the *cost* of that — it caps the prefix — but it does so by throwing the whole conversation away and replacing it with a lossy summary, so after a few compactions you're reasoning from a summary of a summary. Rolling Context sits between Claude Code and Anthropic as a tiny, zero-dependency proxy. When a conversation crosses a token threshold, it summarizes the **old** turns into one continuously-merged timeline and keeps the **recent** turns byte-for-byte intact — so aggressive compression doesn't cost you the live working set. **This is a retention tool, not a cost-saver.** Measured against `/compact`, it costs a *modest premium*, not a saving: you pay a little more to keep the recent detail exact. No API key, no config, no latency on the critical path.
+Claude Code re-sends your **entire** conversation to the API on every turn, and as a session grows that prefix gets re-billed turn after turn. The built-in `/compact` already fixes the *cost* of that — it caps the prefix — but it does so by throwing the whole conversation away and replacing it with a lossy summary, so after a few compactions you're reasoning from a summary of a summary. Rolling Context sits between Claude Code and Anthropic as a tiny, zero-dependency proxy. When a conversation crosses a token threshold, it summarizes the **old** turns into one continuously-merged timeline and keeps the **recent** turns byte-for-byte intact — so aggressive compression doesn't cost you the live working set. **This is a retention tool, not a cost-saver.** Measured against `/compact`, it costs a *modest premium*, not a saving: you pay a little more to keep the recent detail exact. No API key, no config, no latency on the critical path. Whether that trade is worth it depends on your setup; §6 gives the honest use-it / avoid-it call.
 
 ---
 
@@ -153,12 +153,26 @@ Two further honest boundaries:
 
 ---
 
-## 6. Where it doesn't help (and why that's fine)
+## 6. When to use it, when to avoid it
 
-- **Cost is not the differentiator — quality under repetition is.** Lowering Claude Code's own auto-compact threshold buys a **cheaper** cost curve for free: native compaction with no verbatim tail is strictly cheaper than this proxy (§5). What it can't buy is the rolling-verbatim property — built-in compaction replaces the whole conversation each time it fires, so at a low threshold you're soon working from a summary of a summary. Rolling Context exists so aggressive compression doesn't cost you the session; it charges a small premium for that.
-- **On a subscription it is a net cost, not a saving.** This is the honest headline for how the plugin is actually used. At any matched auto-compact threshold the proxy spends more of the rate-limit window than native `/compact` (~+23% at the default 100K, +6% to +47% across the range), and the cheaper-summarizer escape that would close the gap is blocked by the subscription-OAuth classifier (§5). Run it because you want the retention, not because you want to spend less.
-- **It cannot preserve the prompt cache *and* clear server-side.** Anthropic's native [Context Editing][ctxedit] clears old tool results *after* cache lookup (cache-preserving) but only *drops* content, with no summary. This proxy summarizes, but rewrites client-side and so invalidates the cache. The two fight on the cache axis, and you can only have one owner of tool-output lifecycle. Combining them is future work behind a different architecture, not a config flag.
-- **The oldest-first contract leans on the model.** Code guarantees the summary can't grow past the ceiling; *which* material a tight compression sheds is the model following the decay prompt. The guard bounds size, not editorial judgment. If a summarizer ignores the contract and cuts the newest on its first pass, the condense pass re-summarizes already-truncated text and can't bring back what was dropped. The live-backend check (§2) is the honest gate before trusting that behavior.
+The cost analysis settles the money question: at a matched trigger this proxy costs more than native `/compact`, always. So the decision isn't "is it cheaper." It's "do I need what the premium buys." Here's the honest call.
+
+**Use it when:**
+
+- **Your sessions are genuinely long.** Only ~28% of real sessions cross 100K at all (§4); below that the proxy does nothing. If you routinely run multi-hour, multi-hundred-K sessions, there's something to compress and a tail worth protecting.
+- **You compact early and can't afford to lose the recent working set.** This is the one thing native `/compact` can't do: it replaces the whole conversation with a lossy summary every time it fires. The proxy keeps the recent turns byte-for-byte: the code you just read, the exact error text, the file you're editing. If you compress aggressively (100K) *and* need that recent detail exact, this is the only tool that gives you both.
+- **You'll accept the premium for that.** About +23% over native at a matched 100K trigger (§5). If retention of the live working set is worth roughly a quarter more spend, the trade is real.
+- **(API-key users only) You can point summarization at a cheaper model.** On token billing (not a subscription), `ROLLING_CONTEXT_MODEL=claude-haiku-4-5` in flattened mode can land cost-neutral-to-cheaper than native while still keeping a verbatim tail (§5). Validate summary quality first; a cheaper summarizer is a cheaper summary.
+- **(Narrow tail case) You leave native auto-compact high and run monster sessions.** Pin the proxy at 100K, leave native near the window, and on multi-thousand-turn sessions the proxy is much cheaper, up to ~50% at a 900K native trigger (§5, [`crossover.py`](cost-model/crossover.py)). But this is ~1% of sessions; for ordinary use it's a wash.
+
+**Avoid it when:**
+
+- **Cost or rate-limit budget is your binding constraint.** Native `/compact`, optionally at a lower `/config` threshold, is strictly cheaper at any matched trigger. On a Pro/Max subscription the proxy just burns more of your rate-limit window (~+23% at 100K, up to +47% aggressive), and the one lever that could close the gap (a cheaper summarizer) is blocked by the subscription-OAuth classifier (§5). If you want to spend less, this is the wrong tool.
+- **Your work stays under ~100K.** A 20-minute task never reaches the trigger. The proxy is built to do nothing there; run plain Claude Code.
+- **You depend on server-side cache preservation.** Anthropic's native [Context Editing][ctxedit] clears old tool results *after* cache lookup, so it keeps the prompt cache warm, but only drops content, with no summary. This proxy summarizes, but rewrites client-side and so invalidates the cache. The two fight on the cache axis; you get one owner of tool-output lifecycle, not both. Combining them is future work behind a different architecture, not a config flag.
+- **You need a guarantee about *what* a tight compression drops.** The code bounds the summary's *size* (§2): a 20K hard ceiling and a single condense pass, deterministic and tested. It doesn't prove the summary sheds *oldest-first* rather than newest. That rests on the model following the decay contract, and it isn't confirmed against a live backend yet (§2 gate). If which material survives a compression is safety-critical for you, wait for that check.
+
+**The critical bottom line.** For the majority case, a Pro/Max subscription, which is how this plugin is actually installed, this is a premium retention tool, full stop. Its one path to cost-neutrality is closed exactly there, and its central quality claim, oldest-first shedding, is bounded in code but not yet independently verified against a live model. That's not a reason to avoid it. It's the reason to run it for the right motive: you want the recent working set kept verbatim under aggressive compression. Don't run it to save money on a subscription. It won't.
 
 ---
 
