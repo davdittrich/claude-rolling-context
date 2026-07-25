@@ -13,14 +13,20 @@ this directory.
 | `keepfloor.py` | How big is a single turn, and a rolling N-turn working set? (justifies the keep floor) | Your own `~/.claude/projects` |
 | `final.py` | Where is the trigger/keep cost optimum? (basin sweep, first-principles model) | Self-contained (telemetry baked in as params) |
 | `replay.py` | Blend keep vs. flat-token keep, on real growth traces (cost + coverage + coherence) | Your own `~/.claude/projects` |
-| `baseline_honesty.py` | Proxy vs. which baseline? (never-compact vs. native auto-compact) | Self-contained |
+| `parse_sessions.py` | Builds the shared `sessions.json` cache (per-session growth traces) the full-mechanics scripts read | Your own `~/.claude/projects/**/*.jsonl` |
+| `fullmech.py` | Full-mechanics trigger sweep → the 100K optimum & basin (blend keep, saturating summary, decay guard, cache-invalidation) | `sessions.json` |
+| `setpoint.py` | Where does native `/compact` actually fire? (median context before real compaction drops) | Your own `~/.claude/projects/**/*.jsonl` |
+| `summ_rate.py` | Proxy vs. native `/compact`, and the cheaper-summarizer (Haiku/Sonnet) lever | `sessions.json` |
+| `length_cond.py` | Session-length distribution & conditional-remaining (why 100K, not lower) | `sessions.json` |
+| `adaptive.py` | Do turn/velocity-gated triggers beat a fixed 100K? (no, materially) | `sessions.json` |
 | `think_sens.py` | How do extended-thinking tokens move the savings? | Self-contained |
 | `profile_hash.py` | Is the proxy's own overhead material? (hash + TLS timing) | Live timing, imports `../../proxy/server.py` |
 
-`final.py`, `baseline_honesty.py`, and `think_sens.py` are pure models — run them
-anywhere. The other three read **your** local Claude Code transcripts and emit only
-aggregate statistics (percentiles, counts). No transcript content is stored or committed;
-the paths are `~`-relative, so they profile whoever runs them.
+`final.py` and `think_sens.py` are pure models — run them anywhere. The others read
+**your** local Claude Code transcripts (directly, or via the `sessions.json` cache that
+`parse_sessions.py` builds) and emit only aggregate statistics — percentiles, counts,
+costs. No transcript content is stored or committed; `sessions.json` holds only per-turn
+token *counts* and is git-ignored. The paths are `~`-relative, so they profile whoever runs them.
 
 ## Pricing (the units the model runs in)
 
@@ -53,17 +59,22 @@ Your corpus will differ; re-run the scripts to recalibrate.
 
 ## Headline results, and where they land in the brief
 
-- **Trigger basin** (`final.py`): flat-bottomed ~80K–115K; 100K within ~3% of the optimum
-  (~112K) for long sessions; a 60K trigger costs ~22% more, and pushing past ~120K also costs
-  (you carry too much). → brief §4.
+- **Trigger optimum** (`fullmech.py`, full mechanics over 1,940 sessions; `final.py` is the
+  earlier simplified model): flat-bottomed basin, optimum at **exactly 100K**, within 1% over
+  90K–120K; a 50K trigger costs ~36% more, 200K ~11% more. → brief §4.
 - **Blend keep beats flat-token** (`replay.py`, ~430 crossing sessions): the shipped
   `N=8 / hi=40K / floor=3` costs **$1,231 vs. $1,407** for flat `token-40k` — **−12.5%** at
   equal 5-turn coverage (99.3%), and it removes the flat policy's 15.5% "kept only one giant
   turn" coherence hazard (→ 0%). → brief §3, §4.
-- **Honest baseline** (`baseline_honesty.py`): vs. "never compact" the proxy saves ~63% on a
-  long active session, but that baseline is a strawman nobody should run. Against Claude Code's
-  *own* auto-compaction (~160K setpoint) the cost edge is **~12%** — and that ~12% is invariant
-  to the pricing correction, because both sides keep the prefix well under any tier. → brief §5.
+- **Proxy vs. native `/compact` — not a cost saving** (`summ_rate.py` + `setpoint.py`): native
+  compaction fires at a **median 129K** in real transcripts (658 drops measured). Against it the
+  proxy is **~6–15% *more* expensive**, not cheaper — it keeps a verbatim tail and compacts more
+  often. The cheaper-summarizer lever (Haiku) would flip that on token billing, but is blocked on
+  subscription OAuth. The old "~12% cheaper than native" figure came from a mislabeled baseline
+  (a 40K-tail policy, not true native) and is retracted. → brief §5.
+- **Session length** (`length_cond.py`, `adaptive.py`): only ~28% of sessions ever reach 100K;
+  the amortization break-even (~70–100 turns) ≈ median remaining at 100K (~74 turns), which pins
+  the optimum there; turn/velocity-gated triggers add < 0.1%. → brief §4.
 - **Overhead is negligible** (`profile_hash.py`): hashing the message array is **~0.8 ms** at
   the operating point; TLS handshake **~40 ms** — both dwarfed by the 2–15 s LLM stream. → brief §5.
 

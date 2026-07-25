@@ -12,7 +12,7 @@ A transparent proxy that gives Claude Code **rolling context compression** — o
 
 > Claude Code's built-in `/compact` replaces your **entire** conversation with a lossy summary. After a few compactions, you're summarizing a summary of a summary. This plugin only compresses old messages — recent context stays untouched.
 
-It's also a cost story: every token you carry in context gets re-billed on **every turn** (at cache-read rates), so an unmanaged session's input cost grows with the *square* of its length. Capping the prefix makes it linear — [the math](#the-economics-why-capping-the-prefix-matters) works in relative units and holds for every model, and it matters more the bigger the context window, not less.
+**This is a retention tool, not a cost-saver.** Claude Code's built-in `/compact` already caps the prefix, so the cost problem is handled in the box. Measured against `/compact`, this proxy costs a *modest premium* — a few percent to ~15% **more**, not less ([the economics](#the-economics-capping-the-prefix-and-what-it-costs) shows why and how much). What you get for that premium is the recent conversation kept **verbatim** instead of discarded. If your goal is to spend less, use `/compact`. If your goal is aggressive compression that doesn't lose the session, use this.
 
 ## `/compact` vs Rolling Context
 
@@ -23,10 +23,10 @@ It's also a cost story: every token you carry in context gets re-billed on **eve
 | When it runs | Manual or near the context limit | Automatic, background |
 | Latency impact | Blocks until done | Zero — async |
 | After multiple compressions | Summary of summary of summary | Fresh rolling merge each time |
-| Input cost over a long session | Grows with the square of session length | Grows linearly |
+| Input cost over a long session | Capped → grows linearly | Capped → grows linearly, but **~6–15% higher** |
 | Original transcript | Replaced | Preserved (JSONL unchanged) |
 
-## The economics: why capping the prefix matters
+## The economics: capping the prefix, and what it costs
 
 No price cards needed — the argument works in **relative units** that hold for every Claude model. Take the model's fresh-input-token rate as `1×`. The API bills:
 
@@ -39,16 +39,17 @@ No price cards needed — the argument works in **relative units** that hold for
 
 Claude Code re-sends the entire conversation on every turn. Even with caching working perfectly, each turn costs `prefix size × 0.1`. So a session's total input cost is **the sum of the prefix over all turns**:
 
-- **Unmanaged context** (big window, auto-compact only near the limit): the prefix grows every turn, so total cost grows with the *square* of session length. A 1M window doesn't fix this — it just lets the prefix run to 900K+ before anything stops it, and every one of those tokens costs `0.1×` again on every single turn.
-- **Rolling context**: the prefix is capped between `TARGET` and `TRIGGER`, so total cost grows *linearly*.
+- **Never compact (carry everything):** the prefix grows every turn, so total cost grows with the *square* of session length. This is the only case where the square-law bites — and nobody runs it, because a 900K+ prefix exceeds the window and re-reads at `0.1×` on every single turn.
+- **Native `/compact` (the real baseline):** caps the prefix near the context limit, so total cost grows *linearly*. This already solves the cost problem — for free, in the box.
+- **Rolling Context:** also caps the prefix (earlier, at `TRIGGER`), so also *linear* — but **a few percent to ~15% higher** than `/compact`, because it keeps a verbatim tail and therefore compacts more often. That premium buys retention, not savings.
 
 **The cache-miss blast radius matters even more in interactive use.** The prompt cache has a TTL. Read a diff, think for a while, get coffee — and the next turn re-*writes* the whole prefix at `1.25×`. At a 900K prefix, one cold turn bills the equivalent of ~1.1M fresh input tokens. With the prefix capped at ~100K, the identical cold turn is ~9× cheaper. Compression doesn't just shrink the average turn — it caps the worst one.
 
-**What compression itself costs:** each cycle re-writes the new (much smaller) prefix once, and in native mode the summarization request is itself a cache read — a few hundred fresh tokens, measured (see below). Ballpark: sessions that accumulate past ~100K of context — a couple of hours of real work — come out ahead, and the gap compounds from there. Short sessions are a wash; don't expect magic on a 20-minute task.
+**What compression itself costs:** each cycle re-writes the new (much smaller) prefix once, *plus* the summary itself as output — up to a 16K-token cap, the largest single slice. In native mode the summarization *input* is a cache read (a few hundred fresh tokens, measured — see below), but the summary output is billed in full. Net effect: over a long session the proxy costs a few percent to ~15% **more** than native `/compact`, not less — it does the same summarization *plus* carries a verbatim tail *plus* compacts more often. The full model, baselines, and the 100K-optimum derivation are in [the design brief](docs/design-brief.md) §4–§5. Short sessions are a wash; expect no cost change on a 20-minute task.
 
-**On Pro/Max subscriptions** none of this is dollars, but the same math applies in a different currency: rate-limit accounting weights cache reads far below fresh input, so the identical curves decide how fast you burn your 5-hour window.
+**On Pro/Max subscriptions** none of this is dollars — it's rate-limit budget, and the honest headline is that the proxy burns **more** of your window than native `/compact` (by the same few-to-~15%), because it carries the tail and compacts more often. The one lever that could close the gap — summarizing on a cheaper model like Haiku — needs either a separate API key or a flattened request that the subscription-OAuth classifier rejects (the reason native mode exists). So on a subscription there is no way to make this cost-neutral. Run it for retention, not to stretch the window.
 
-> **Honest note:** if cost were the *only* goal, lowering Claude Code's auto-compact threshold (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`) buys a similar spend curve for free. What it can't buy is quality under repetition: built-in compaction replaces the whole conversation with a lossy summary every time it fires — at a low threshold it fires often, and you're soon working from a summary of a summary of a summary. The rolling design exists so aggressive compression doesn't cost you the session: recent work stays verbatim, and old work lives in one continuously-merged timeline instead of N generations of loss.
+> **Honest note:** if cost were the *only* goal, this is the wrong tool — native `/compact` (optionally at a lower `CLAUDE_CODE_AUTO_COMPACT_WINDOW`) is **cheaper**, because it keeps no verbatim tail. What it can't buy is quality under repetition: built-in compaction replaces the whole conversation with a lossy summary every time it fires — at a low threshold it fires often, and you're soon working from a summary of a summary of a summary. The rolling design exists so aggressive compression doesn't cost you the session: recent work stays verbatim, and old work lives in one continuously-merged timeline instead of N generations of loss. You pay a small premium for that.
 
 ## How It Works
 
@@ -84,7 +85,7 @@ This fork keeps the upstream design (transparent proxy, rolling summary, verbati
 - **Bounded, non-leaking store** — the compression store is capped and LRU-evicts inactive entries (`ROLLING_CONTEXT_STORE_MAX`), and it no longer pins compressed-away message history in memory by default (`ROLLING_CONTEXT_DEBUG_MESSAGES`).
 - **Correctness fixes** — non-streaming (`stream:false`) responses now parse real token usage; SSE usage parsing only touches the two events that carry it; a foreign `ROLLING_CONTEXT_MODEL` correctly switches to flattened mode (no silent prompt-cache miss); malformed/empty summarizer replies raise instead of injecting a `"None"` summary; message-shape guards prevent consecutive-user-turn and orphaned-`tool_result` 400s; native re-summarization carries the prior timeline forward rather than restarting it.
 - **Bounded rolling summary** — the summary self-limits instead of growing forever. Its invariants (the Active Goal, your stated constraints, and Key Details) stay at full fidelity, while the oldest Timeline entries are merged into denser bullets as the summary nears a ~16K-token soft target. A 20K-token hard ceiling plus a deterministic condense pass — triggered on truncation or over-ceiling — guarantees the newest events are never the ones dropped.
-- **A stdlib test suite** — 86 `unittest` cases, no pip deps:
+- **A stdlib test suite** — 93 `unittest` cases, no pip deps:
   ```bash
   python3 -m unittest discover -s tests
   ```

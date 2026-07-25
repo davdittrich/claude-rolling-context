@@ -1,12 +1,12 @@
 # Rolling Context — Design Brief
 
-*How the proxy works, why its thresholds sit where they do, and what it is expected to save.*
+*How the proxy works, why its thresholds sit where they do, and an honest account of what it costs.*
 
 ---
 
 ## The one-paragraph version
 
-Claude Code re-sends your **entire** conversation to the API on every turn. As a session grows, that prefix gets re-billed turn after turn, and the built-in `/compact` "fix" throws the whole thing away and replaces it with a lossy summary — so after a few compactions you're reasoning from a summary of a summary. Rolling Context sits between Claude Code and Anthropic as a tiny, zero-dependency proxy. When a conversation crosses a token threshold, it summarizes the **old** turns into one continuously-merged timeline and keeps the **recent** turns byte-for-byte intact. You stop paying for an ever-growing prefix, and you stop losing the detail that matters. No API key, no config, no latency on the critical path.
+Claude Code re-sends your **entire** conversation to the API on every turn, and as a session grows that prefix gets re-billed turn after turn. The built-in `/compact` already fixes the *cost* of that — it caps the prefix — but it does so by throwing the whole conversation away and replacing it with a lossy summary, so after a few compactions you're reasoning from a summary of a summary. Rolling Context sits between Claude Code and Anthropic as a tiny, zero-dependency proxy. When a conversation crosses a token threshold, it summarizes the **old** turns into one continuously-merged timeline and keeps the **recent** turns byte-for-byte intact — so aggressive compression doesn't cost you the live working set. **This is a retention tool, not a cost-saver.** Measured against `/compact`, it costs a *modest premium*, not a saving: you pay a little more to keep the recent detail exact. No API key, no config, no latency on the critical path.
 
 ---
 
@@ -18,7 +18,7 @@ A second effect sharpens this. **Cache misses:** the prompt cache has a TTL (5 m
 
 (Earlier Sonnet-4/4.5-era 1M models added a third force — a `2× input / 1.5× output` premium on everything above 200K prompt tokens. Current Opus and Sonnet price the full 1M window [flat][price], so that penalty band no longer applies; the numbers below assume flat pricing.)
 
-Capping the prefix bends that super-linear curve back toward a line. That is the entire thesis.
+Capping the prefix bends that super-linear curve back toward a line — **but Claude Code's built-in `/compact` already caps the prefix.** The money problem is solved in the box. What `/compact` *pays* for that cap — discarding the whole conversation each time it fires — is the actual problem this proxy addresses. So read this section as *the mechanism*, not the pitch: §5 is blunt that against the real baseline the proxy costs slightly more, not less.
 
 ---
 
@@ -100,49 +100,57 @@ The two numbers that matter are the **trigger** (100K) and the **keep** (blend a
 
 ### The trade-off the trigger balances
 
-Compression isn't free: rewriting the prefix **invalidates the prompt cache** for everything downstream, so the first turn after a compression re-writes the kept tail at 1.25× instead of reading it at 0.1×. That fixed-ish overhead pushes toward compressing **rarely** (higher trigger, shed more each time). Meanwhile, carrying a bigger prefix every turn at 0.1× pushes toward compressing **early** (lower trigger). The optimum is where those meet.
+Compression isn't free: rewriting the prefix **invalidates the prompt cache** for everything downstream, so the first turn after a compression re-writes the kept tail at 1.25× instead of reading it at 0.1×. On top of that, the summary itself is billed as output, up to the 16K soft cap — the single largest slice of each compaction's cost. That overhead pushes toward compressing **rarely** (higher trigger, shed more each time). Meanwhile, carrying a bigger prefix every turn at 0.1× pushes toward compressing **early** (lower trigger). The optimum is where those meet.
 
-Modeling that trade-off against the telemetry produced a **flat-bottomed cost basin from ~80K–115K**, with the minimum near ~112K for long sessions. The practical read:
+Replaying the **full current mechanics** — blend keep, the rolling summary that grows and saturates the 16K cap, the decay guard, and the cache-invalidation penalty — over **1,940 real sessions (114K turns)** puts the cost optimum at **exactly 100K** ([`fullmech.py`](cost-model/fullmech.py)). It is a flat-bottomed basin: within 1% of optimum from **90K–120K**, within 2% from 80K–130K. The practical read:
 
-- **100K sits within ~3% of the optimum** for the long, active sessions that actually cross the threshold — and it's the value the tool ships.
-- Going **too low** is the real mistake: a 60K trigger costs ~22% more than 100K, because you keep paying the tail-rebuild penalty too often. Pushing much past ~120K also costs, since you then carry the extra prefix on every turn.
-- The trigger is a modest lever, single-digit to low-double-digit percent across the basin. The bigger levers are (a) *having* compression on at all, and (b) the size of the kept tail.
+- **100K is the optimum, and it's the value the tool ships.** The optimum stays in 90–120K across every summary-size assumption swept.
+- Going **too low** is the real mistake: a 50K trigger costs ~36% more, because you pay the tail-rebuild penalty *and* the summary-output cost too often. Pushing to 200K costs ~11% more — you then carry the extra prefix on every turn.
+- This is the cheapest way to run *the proxy*. It does **not** mean the proxy is cheaper than `/compact` — see §5.
 
-On the keep side, the blend (`N=8, floor=3, ~40K cap`) earns its extra complexity on a replay of the ~430 real sessions that cross the trigger ([`replay.py`](cost-model/replay.py)). At the **same 5-turn coverage** (99.3%) it costs **~12% less** than a flat 40K-token budget, and it removes that policy's 1-in-6 "keep only a giant dump" coherence hazard: 16% of flat-policy compressions collapse to a single kept turn, against 0% for the blend.
+**Session length is why 100K, and not lower.** Only **~28% of real sessions ever reach 100K** of context; the median tops out near 74K and never compacts at all ([`length_cond.py`](cost-model/length_cond.py)). Among the sessions that do cross, the amortization break-even — how many more turns a compaction needs before its overhead pays back — is **~70–100 turns**, dominated by that up-to-16K summary output. That break-even nearly equals the **median remaining length at 100K (~74 turns)**, which is exactly the condition that pins the optimum there: trigger any lower and you compact sessions that end before they amortize; any higher and long sessions carry an oversized prefix. Conditioning the trigger on how long a session has *already* run adds almost nothing (< 0.1% in replay, [`adaptive.py`](cost-model/adaptive.py)) — because reaching a high context is itself the signal of a long session.
+
+On the keep side, the blend (`N=8, floor=3, ~40K cap`) earns its extra complexity on a replay of the real sessions that cross the trigger ([`replay.py`](cost-model/replay.py)). At the **same 5-turn coverage** (99.3%) it costs **~12% less** than a flat 40K-token budget *of the same policy*, and it removes that policy's 1-in-6 "keep only a giant dump" coherence hazard: 16% of flat-policy compressions collapse to a single kept turn, against 0% for the blend. (This is a keep-policy comparison — blend vs. flat, both inside the proxy — not a comparison against `/compact`.)
 
 ---
 
-## 5. Evidence for the expected savings — and against which baseline
+## 5. What it costs — and why cost is not the reason to run it
 
-**What this is:** a first-principles cost model in the API's real relative units, driven by measured per-turn growth, turn counts, and cache-warmth from ~1,900 real Claude Code sessions (median context 89K tokens, p90 487K; growth/turn median 1.6K, p90 6.6K; 28 turns/session median, p90 88; 430 of them long enough to cross the trigger). It is a model calibrated to real usage, not a live billing A/B, so treat every figure as a grounded estimate rather than an invoice.
+**What this is:** a first-principles cost model in the API's real relative units, driven by **1,940 real Claude Code sessions (114K turns)** and the **full current mechanics** — the blend keep policy, a rolling summary that grows with the dropped history and saturates its 16K soft cap (the guard fires on ~37% of compactions), and the cache-invalidation penalty each compression pays. It is a model calibrated to real usage, not a live billing A/B, so treat every figure as a grounded estimate, not an invoice. Scripts under [`docs/cost-model/`](cost-model/): [`fullmech.py`](cost-model/fullmech.py), [`summ_rate.py`](cost-model/summ_rate.py), [`setpoint.py`](cost-model/setpoint.py).
 
-**The percentage is meaningless without naming the baseline, and this is where savings claims get dishonest.** Compression only caps the input *prefix*; what you save depends entirely on how large that prefix would otherwise have grown. Worked for a long-but-typical session — a sustained active session near the p90 of real contexts (3.4K growth/turn over 150 turns, prefix peaking ~517K if left unmanaged):
+**The headline, stated plainly: this proxy does not save money against Claude Code's built-in `/compact`. It costs modestly more.** Both cap the prefix, so both make a long session's input cost grow linearly rather than quadratically. The difference is what each keeps. Native `/compact` discards the whole conversation and keeps only a summary. The proxy additionally keeps a verbatim recent tail, *and* produces a summary, *and* — because that tail raises the floor it compacts back down to — fires somewhat more often. More work costs more.
 
-| Proxy (@100K, keep 40K) compared against | Cost saving |
+Measured from **658 real native compactions** in the telemetry, Claude Code's own compaction fires at a **median context of 129K (mean 153K)** ([`setpoint.py`](cost-model/setpoint.py)). Modeling both policies over the same 1,940 sessions:
+
+| Comparison (modeled, full mechanics) | Result |
 |---|--:|
-| **"Never compact — carry everything"** | ~63% |
-| **Native auto-compact, realistic setpoint (~160K)** | **~12%** |
+| Proxy @100K vs. native `/compact` at its measured median (~129K) | **~15% more expensive** |
+| Proxy @100K vs. native `/compact` at a high setpoint (~160K) | **~6% more expensive** |
+| Proxy @100K vs. "never compact — carry everything" | ~80% cheaper |
 
-The gap between those two rows *is* the honest story. The 63% is real arithmetic, but it is measured against a baseline nobody should run: letting the prefix grow unmanaged and re-reading all of it, at cache-read rates, on every single turn. The moment you compare against Claude Code's *own* compaction, which also caps the prefix, the cost edge falls to **~12%** — and that ~12% is untouched by the pricing correction above, because both sides keep the prefix well under any tier.
+The last row is real arithmetic against a baseline **nobody can run** — an unmanaged prefix exceeds the context window and re-reads on every turn. Quoting it as a "saving" would be dishonest. The only baseline that matters is Claude Code's own compaction, and against that the proxy is a **single-digit-to-~15% premium**, not a saving.
 
-So the honest cost headline is **low-double-digit percent cheaper than Claude Code's default compaction on a long session.** In dollars that is real but small: on the order of a dollar or two per long session against the realistic baseline, low tens across a heavy day, not orders of magnitude.
+**Correcting the record.** An earlier version of this brief claimed the proxy was *~12% cheaper* than native compaction. That number came from a mislabeled baseline in the cost model: the "native compact" row actually kept a 40K verbatim tail — i.e. it was the proxy's *own* policy at a higher trigger, not native compaction at all. True native compaction keeps no verbatim tail. Against it, the sign flips. The old claim is retracted.
 
-**Cost is not the reason to run this.** The proxy's genuine differentiator over native compaction is **retention quality, not price**: native compaction discards the whole conversation and replaces it with a summary each time it fires, so at an aggressive threshold you are soon reasoning from a summary-of-a-summary. The proxy keeps the recent tail **byte-for-byte** and summarizes only the old span — which is what lets you compress *early and hard* (100K) without the degradation. The ~12% cost edge is a side effect; the point is compressing aggressively without losing the session.
+**The one lever that could reverse it — and why subscription users can't pull it.** The proxy's per-compaction cost is dominated by the summary *output*, billed at the session model's output rate (Opus, $25/MTok). Point summarization at a cheaper model — Haiku, 5× cheaper output — and the picture changes: on **token/API billing**, a flattened Haiku summarizer at ~100K with a ~25K tail lands cost-neutral-to-cheaper than native `/compact` *while still keeping a verbatim tail*. Native `/compact` structurally cannot do this — it is locked to the session model. But **that lever is unavailable on a Pro/Max subscription, which is how this plugin is actually used.** Native mode forces the session model precisely so the cloned request passes Anthropic's subscription-OAuth classifier; routing a cheaper model requires flattened mode, whose bare, non-session-shaped request is exactly what that classifier is built to reject (the reason native mode exists — see the compressor module header's issue-#4 note). It is untested against a live backend, but the strong prior is rejection. **So for subscription users there is no cheaper-summarizer path, and the proxy is a budget premium over `/compact`, full stop.**
 
-**Thinking tokens shift the percentage, not the dollars.** Extended-thinking tokens are billed as output and are *compression-invariant*: you generate the same reasoning for the current task regardless of prefix size, and Claude Code drops prior-turn thinking from the context it resends, so it never accumulates in the growing prefix at all. The model prices output at the telemetry median (≈330 tok/turn, i.e. light thinking). Heavier thinking (2–4K tok/turn) leaves the **dollar** saving essentially unchanged — the same reasoning is billed on the compressed and uncompressed side alike — while the **percentage** shrinks, because thinking inflates the shared denominator ([`think_sens.py`](cost-model/think_sens.py)). The conclusion holds either way: against a realistic native-compact baseline the edge is low-double-digit.
+**On a subscription, "cost" is rate-limit budget, and the proxy burns more of it.** Nothing here is dollars on Pro/Max. But the same curves govern how fast you burn the rate-limit window, and the proxy — carrying the tail and compacting more often — spends **more** of that window than native `/compact`, by the same ~6–15%. If your only goal is to stretch the rate-limit window, native `/compact` (optionally at a lower threshold) is cheaper, and this proxy is the wrong tool.
+
+**So why run it at all? Retention quality — and only that.** Native compaction replaces the whole conversation with a summary each time it fires, so at an aggressive threshold you are soon reasoning from a summary of a summary. The proxy keeps the recent tail **byte-for-byte** and summarizes only the old span, which is what lets you compress early (100K) without that degradation. The summary quality on the *old* material is comparable to native's — both are summaries — but the recent tail, the part you're actively working in, stays exact. That is the whole value proposition, and it costs the premium above. If you value keeping the live working set intact, the premium buys something real. If you want lower spend, it does not.
+
+**Thinking tokens shift the percentage, not the dollars.** Extended-thinking tokens are billed as output and are *compression-invariant*: you generate the same reasoning for the current task regardless of prefix size, and Claude Code drops prior-turn thinking from the context it resends, so it never accumulates in the growing prefix at all. The model prices output at the telemetry median (≈330 tok/turn, i.e. light thinking). Heavier thinking (2–4K tok/turn) leaves the premium's dollar magnitude essentially unchanged while shrinking it as a percentage, because thinking inflates the shared denominator ([`think_sens.py`](cost-model/think_sens.py)).
 
 Two further honest boundaries:
 
 - **Short sessions are a wash.** Under ~100K of accumulated context — a 20-minute task — there is little to compress and the overhead isn't worth it. The tool is designed to do nothing there.
 - **The proxy's own overhead is negligible.** Hashing the message array costs about **0.8 ms/request** at the operating point (~90K), and the upstream TLS handshake ~40 ms; both are dwarfed by the 2–15 second LLM stream they sit behind. Two proposed micro-optimizations were measured, then deliberately left unbuilt ([`profile_hash.py`](cost-model/profile_hash.py)).
 
-On Pro/Max subscriptions none of this is dollars at all. The same prefix-size curves still govern how fast you burn the 5-hour rate-limit window, since limit accounting weights cache reads far below fresh input.
-
 ---
 
 ## 6. Where it doesn't help (and why that's fine)
 
-- **Quality under repetition, not raw spend, is the real differentiator.** Lowering Claude Code's own auto-compact threshold buys a similar *cost* curve for free. What it can't buy is the rolling-verbatim property: built-in compaction replaces the whole conversation each time it fires, so at a low threshold you're soon working from a summary of a summary. Rolling Context exists so aggressive compression doesn't cost you the session.
+- **Cost is not the differentiator — quality under repetition is.** Lowering Claude Code's own auto-compact threshold buys a **cheaper** cost curve for free: native compaction with no verbatim tail is strictly cheaper than this proxy (§5). What it can't buy is the rolling-verbatim property — built-in compaction replaces the whole conversation each time it fires, so at a low threshold you're soon working from a summary of a summary. Rolling Context exists so aggressive compression doesn't cost you the session; it charges a small premium for that.
+- **On a subscription it is a net cost, not a saving.** This is the honest headline for how the plugin is actually used. The proxy spends ~6–15% more of the rate-limit window than native `/compact`, and the cheaper-summarizer escape that would close the gap is blocked by the subscription-OAuth classifier (§5). Run it because you want the retention, not because you want to spend less.
 - **It cannot preserve the prompt cache *and* clear server-side.** Anthropic's native [Context Editing][ctxedit] clears old tool results *after* cache lookup (cache-preserving) but only *drops* content, with no summary. This proxy summarizes, but rewrites client-side and so invalidates the cache. The two fight on the cache axis, and you can only have one owner of tool-output lifecycle. Combining them is future work behind a different architecture, not a config flag.
 - **The oldest-first contract leans on the model.** Code guarantees the summary can't grow past the ceiling; *which* material a tight compression sheds is the model following the decay prompt. The guard bounds size, not editorial judgment. If a summarizer ignores the contract and cuts the newest on its first pass, the condense pass re-summarizes already-truncated text and can't bring back what was dropped. The live-backend check (§2) is the honest gate before trusting that behavior.
 
@@ -179,6 +187,6 @@ On Pro/Max subscriptions none of this is dollars at all. The same prefix-size cu
 | Tiered-decay + condense prompts | `proxy/compressor.py` → `SUMMARY_RULES`, `NATIVE_COMPACT_PROMPT`, `CONDENSE_PROMPT` |
 | Install / `ANTHROPIC_BASE_URL` wiring | `hooks/start-proxy.sh`, `install.sh` |
 | Configuration (all env vars) | `README.md` → Configuration |
-| The economics, in full | `README.md` → "The economics: why capping the prefix matters" |
+| The economics, in full | `README.md` → "The economics: capping the prefix, and what it costs" |
 
 *Defaults:* `ROLLING_CONTEXT_TRIGGER=100000`, `ROLLING_CONTEXT_TARGET=40000`, `ROLLING_CONTEXT_KEEP_TURNS=8`, `ROLLING_CONTEXT_KEEP_FLOOR=3`, `ROLLING_CONTEXT_STORE_MAX=32`.
