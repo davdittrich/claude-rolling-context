@@ -3,7 +3,7 @@
 Invariant proven here: NATIVE_COMPACT_PROMPT mandates that a leading prior
 [ROLLING_CONTEXT_SUMMARY] block be carried forward and extended with
 oldest-first Timeline decay, WITHOUT changing the span native sends
-byte-identical, preserving the prompt-cache read). This is a structural test:
+(`messages[:cut]` stays byte-identical, preserving the prompt-cache read). This is a structural test:
 it proves the instruction text is present and that the assembled output still
 contains exactly one summary block. It does NOT assert "drift is reduced" —
 that is a model-behavior claim unprovable without a real backend.
@@ -23,7 +23,7 @@ from _fakes import FakeSummarizerConn  # noqa: E402
 
 
 class NativeCompactPromptTextTest(unittest.TestCase):
-    """The prompt string itself must mandate verbatim carry-forward."""
+    """The prompt string itself must mandate oldest-first decay."""
 
     def test_mandates_oldest_first_decay(self):
         prompt = compressor.NATIVE_COMPACT_PROMPT
