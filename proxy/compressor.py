@@ -557,7 +557,11 @@ class RollingCompressor:
     # Flattened mode: standalone request to a custom summarizer
     # ------------------------------------------------------------------
 
-    def _summarize_flattened(self, prompt: str, auth_headers: dict) -> str:
+    def _summarize_flattened_once(self, prompt: str, auth_headers: dict) -> tuple:
+        """Single flattened summarization request. Returns (text, truncated),
+        where truncated is True if the upstream stopped at the token cap
+        (openai finish_reason == "length" / anthropic stop_reason ==
+        "max_tokens"). No guard/retry here — the caller applies the guard."""
         summary_max_tokens = 20000
         model = self.summarizer_model or LEGACY_DEFAULT_MODEL
 
@@ -623,7 +627,8 @@ class RollingCompressor:
             content = (choices[0].get("message") or {}).get("content")
             if not isinstance(content, str) or not content.strip():
                 raise _empty_reply_error("empty text")
-            return content
+            truncated = choices[0].get("finish_reason") == "length"
+            return content, truncated
 
         content_blocks = data.get("content") or []
         if not content_blocks:
@@ -631,6 +636,26 @@ class RollingCompressor:
         text = content_blocks[0].get("text")
         if not isinstance(text, str) or not text.strip():
             raise _empty_reply_error("empty text")
+        truncated = data.get("stop_reason") == "max_tokens"
+        return text, truncated
+
+    def _summarize_flattened(self, prompt: str, auth_headers: dict) -> str:
+        """Flattened summarization with the oldest-first decay guard: if the
+        first pass truncated at the cap or overflows the hard ceiling, run one
+        condense pass (same wire format, no recursion) folding the oldest
+        Timeline. Mirrors the native guard in _summarize_native."""
+        text, truncated = self._summarize_flattened_once(prompt, auth_headers)
+        if truncated or len(text) > HARD_CEILING_TOKENS * 4:
+            log.info(
+                f"Flattened summary guard fired (truncated={truncated}, "
+                f"chars={len(text):,}) -> condense pass"
+            )
+            text, _ = self._summarize_flattened_once(CONDENSE_PROMPT + text, auth_headers)
+            if len(text) > HARD_CEILING_TOKENS * 4:
+                log.warning(
+                    f"Flattened summary still over budget after condense "
+                    f"({len(text):,} chars)"
+                )
         return text
 
     # ------------------------------------------------------------------
