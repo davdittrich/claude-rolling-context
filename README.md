@@ -73,6 +73,14 @@ At a matched auto-compact threshold this proxy always costs **more** than the bu
 
 Full evidence, and the pin-proxy/raise-native tail case where the proxy does come out ahead, are in the [design brief](docs/design-brief.md) §5–§6.
 
+## What about asking Claude to write a handoff doc?
+
+A mainstream alternative to both `/compact` and this proxy: at a breakpoint, have Claude write a handoff file, `/clear`, and start fresh on it. Anthropic lists `/clear` with "a brief you've distilled from what you just learned" as a first-class move ([session management](https://claude.com/blog/using-claude-code-session-management-and-1m-context)), and practitioners productized [`/handoff` skills](https://github.com/robertguss/claude-code-toolkit/tree/main/skills/handoff) and Cline's [Memory Bank](https://docs.cline.bot/best-practices/memory-bank) around it. It has one genuine win this proxy can't match: **cross-session resume**. When the prompt cache expires over lunch, resuming re-pays the whole history; a one-screen handoff makes the next session cost a few hundred tokens ([bswen](https://docs.bswen.com/blog/2026-06-29-claude-handoff-file-vs-compact/)).
+
+Two catches. Anthropic's `/clear` is strong because *you* write the brief — "you control exactly what carries forward." The popular version asks *Claude* to write it, which makes it a lossy model summary like `/compact`, authored (Anthropic's words) when "the model is at its least intelligent point." And `/clear` keeps **no verbatim tail**: the exact code, error, and file you were on are gone, and a bad handoff is unrecoverable once cleared. The proxy keeps the tail byte-for-byte and only ever summarizes the recent increment, never a saturated window.
+
+Use the handoff at real boundaries — task done, agent handoff, stepping away overnight — where a clean window and a cheap resume beat exact recency. Use the proxy through one long entangled session where losing recent detail hurts. They stack, which is also how Cline frames it: auto-compaction for routine, a manual state update for checkpoints.
+
 ## How It Works
 
 ```

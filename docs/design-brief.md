@@ -172,6 +172,18 @@ The cost analysis settles the money question: at a matched trigger this proxy co
 - **You depend on server-side cache preservation.** Anthropic's native [Context Editing][ctxedit] clears old tool results *after* cache lookup, so it keeps the prompt cache warm, but only drops content, with no summary. This proxy summarizes, but rewrites client-side and so invalidates the cache. The two fight on the cache axis; you get one owner of tool-output lifecycle, not both. Combining them is future work behind a different architecture, not a config flag.
 - **You need a guarantee about *what* a tight compression drops.** The code bounds the summary's *size* (§2): a 20K hard ceiling and a single condense pass, deterministic and tested. It doesn't prove the summary sheds *oldest-first* rather than newest. That rests on the model following the decay contract, and it isn't confirmed against a live backend yet (§2 gate). If which material survives a compression is safety-critical for you, wait for that check.
 
+**Where the "ask Claude to write a handoff" workflow sits.** A widely-practiced alternative skips both `/compact` and this proxy: at a breakpoint, have the model write a handoff file, run `/clear`, and start a fresh session on it. This is mainstream. Anthropic's own session-management guidance lists `/clear` — "start a new session, usually with a brief you've distilled from what you just learned" — as one of five first-class context moves, and ships a `/rewind` "summarize from here" that writes "a handoff message ... from its future self" [ccsm]; the context-engineering guide recommends an external `NOTES.md` and a file-based memory tool for state that outlives the window [ctxeng]. Practitioners productized it: `/handoff` skills that emit a structured state doc and launch a fresh session [handoff], and Cline's **Memory Bank**, updated "before the window clears, letting you continue seamlessly in a fresh conversation" [membank]. A popular writeup puts it bluntly — "I never, ever `/compact`" — with a canonical HANDOFF schema of goal, state, decisions, mistakes, TODOs, gotchas, and file links [bswen]. Take the strongest version.
+
+The one axis where the handoff genuinely wins — and §5's cost model doesn't cover it — is **cross-session resume after the prompt cache dies.** §5 measures *in-session* re-billing; the handoff advocates chase a different cost. Leave a long thread over lunch, the subscription cache expires, and resuming re-pays the entire history [bswen]. Neither `/compact` nor this proxy fully escapes that — both leave a prefix a cold resume must re-read. A one-screen handoff collapses the resume to a few hundred tokens. On the resume axis, handoff beats the proxy beats a raw resume. Real, and conceded.
+
+But the popular variant forfeits the advantage its advocates claim. Anthropic's `/clear` is powerful precisely because *you* author the brief: "you write down what matters," "you control exactly what carries forward" [ccsm]. The practice people run inverts that — "*ask Claude* to create a HANDOFF" [bswen]. Once the model writes it, the handoff is a lossy model summary, the same failure class as `/compact`, and "you control what survives" is worth only the attention you spend auditing it. Anthropic names the deeper trap: "the model is at its least intelligent point when compacting," because context rot has already set in [ccsm]. A handoff authored at the end of a bloated four-hour session is written by exactly that degraded model. Its "avoids summary-of-summary" and "few hundred tokens" hold only if the doc is written *early* and *short*; write it late and it inherits the rot it was meant to escape.
+
+Two things the proxy does that the handoff structurally can't. It keeps the recent tail **byte-for-byte** — `/clear` discards the exact file, error, and half-finished tool chain, and whatever the author missed is gone. And it never summarizes the whole history in one pass: each cycle folds the prior dense summary plus only the turns aged past the tail, so no summarization faces a saturated window — the incremental answer to "least intelligent when compacting."
+
+One failure asymmetry seals it. A hallucinated handoff, once you `/clear`, is unrecoverable except by mining raw JSONL. A bad rolling summary is bounded: the verbatim tail still holds recent truth and the next compression re-merges from it. The handoff trades a continuous safety net for a clean slate, and a clean slate keeps no receipts.
+
+So they compose, and the vendors say so. Cline recommends "Auto Compact ... for routine" with a manual state update "for important checkpoints" [membank]; Anthropic frames subagents and `/clear` as boundary tools, not session-long ones [ccsm]. At a real semantic boundary — task done, agent handoff, stepping away overnight — write the doc and `/clear`; nothing beats a clean window, a portable artifact, and a near-zero resume. Through one long entangled session where you can't predict which detail you'll need and won't stop to summarize, the proxy's verbatim tail and drift-resistant incremental summary are what the premium buys. Proxy through the long middle, handoff at the true boundary.
+
 **The critical bottom line.** For the majority case, a Pro/Max subscription, which is how this plugin is actually installed, this is a premium retention tool, full stop. Its one path to cost-neutrality is closed exactly there, and its central quality claim, oldest-first shedding, is bounded in code but not yet independently verified against a live model. That's not a reason to avoid it. It's the reason to run it for the right motive: you want the recent working set kept verbatim under aggressive compression. Don't run it to save money on a subscription. It won't.
 
 ---
@@ -182,10 +194,20 @@ The cost analysis settles the money question: at a matched trigger this proxy co
 - **Prompt caching** — cache read/write rates and the 5-minute TTL the trigger economics turn on: <https://platform.claude.com/docs/en/build-with-claude/prompt-caching>
 - **Context editing** — Anthropic's native, cache-preserving tool-result clearing (§6): <https://platform.claude.com/docs/en/build-with-claude/context-editing>
 - **Cost model & telemetry** — the scripts behind every §4–§5 figure: [`docs/cost-model/`](cost-model/)
+- **Claude Code session management** — Anthropic's own `/clear` vs `/compact` vs subagents guidance, and the "least intelligent point when compacting" observation (§6): <https://claude.com/blog/using-claude-code-session-management-and-1m-context>
+- **Effective context engineering** — Anthropic on external memory (`NOTES.md`, file-based memory tool) and compaction (§6): <https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents>
+- **HANDOFF-file practice** — a representative advocate for handoff-over-`/compact` and the cross-session resume argument (§6): <https://docs.bswen.com/blog/2026-06-29-claude-handoff-file-vs-compact/>
+- **`/handoff` skill** — one productized write-state-then-fresh-session implementation (§6): <https://github.com/robertguss/claude-code-toolkit/tree/main/skills/handoff>
+- **Cline Memory Bank** — markdown state files updated before the window clears; auto-compact for routine, manual update for checkpoints (§6): <https://docs.cline.bot/best-practices/memory-bank>
 
 [price]: https://platform.claude.com/docs/en/about-claude/pricing
 [cache]: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
 [ctxedit]: https://platform.claude.com/docs/en/build-with-claude/context-editing
+[ccsm]: https://claude.com/blog/using-claude-code-session-management-and-1m-context
+[ctxeng]: https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents
+[bswen]: https://docs.bswen.com/blog/2026-06-29-claude-handoff-file-vs-compact/
+[handoff]: https://github.com/robertguss/claude-code-toolkit/tree/main/skills/handoff
+[membank]: https://docs.cline.bot/best-practices/memory-bank
 
 ---
 
