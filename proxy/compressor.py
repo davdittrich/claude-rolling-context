@@ -158,6 +158,15 @@ CONVERSATION TO COMPRESS:
 
 Write the chronological summary:"""
 
+CONDENSE_PROMPT = """The text below is a rolling conversation summary that exceeded its size budget. Rewrite it to fit within 16,000 tokens.
+
+Preserve at full fidelity, never dropping: the ## Active Goal section, any stated user constraints or rules, and the ## Key Details section.
+Compress the OLDEST ## Timeline entries by merging adjacent steps into denser milestone bullets. Never drop the newest entries.
+Keep the same section headings and markdown structure. Output ONLY the rewritten summary, nothing else.
+
+SUMMARY TO CONDENSE:
+"""
+
 
 class RollingCompressor:
     def __init__(
@@ -408,6 +417,32 @@ class RollingCompressor:
             snippet = resp_body.decode("utf-8", errors="replace")[:300]
             raise RuntimeError(f"Summarization returned empty text; response starts: {snippet}")
         return summary, stop_reason
+
+    def _condense_summary(self, summary_text: str, auth_headers: dict, model: str) -> str:
+        """Recursive backstop: re-summarize an over-budget summary under the
+        soft target, preserving invariants and folding the oldest Timeline.
+        Uses a standalone request (no cache dependency — rare guard path)."""
+        body = {
+            "model": model,
+            "max_tokens": 20000,
+            "stream": True,
+            "messages": [{"role": "user", "content": CONDENSE_PROMPT + summary_text}],
+        }
+        req_body = json.dumps(body).encode()
+        headers = _clean_headers(auth_headers)
+        headers["content-length"] = str(len(req_body))
+        headers["accept-encoding"] = "identity"
+        summarizer_path = _join_path(_SUMMARIZER_PATH, "/v1/messages")
+        log.info(f"Summary over budget -> condense pass ({len(summary_text):,} chars)")
+        conn = _summarizer_conn()
+        conn.request("POST", summarizer_path, body=req_body, headers=headers)
+        resp = conn.getresponse()
+        resp_body = resp.read()
+        conn.close()
+        if resp_body[:2] == b"\x1f\x8b":
+            resp_body = gzip.decompress(resp_body)
+        text, _sr = self._parse_summary_sse(resp_body)
+        return text
 
     def _summarize_native(self, payload: dict, messages: list, cut: int, auth_headers: dict) -> str:
         """Send the session's own request shape with a compact instruction.
