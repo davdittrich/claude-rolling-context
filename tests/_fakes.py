@@ -39,25 +39,45 @@ class FakeResponse:
 
 
 class FakeSummarizerConn:
-    """Fake `_summarizer_conn()` return value. `getresponse()` always emits
-    a single content_block_delta SSE event carrying `reply_text` (default
-    "summary", matching the historical hardcoded fixture used by the two
-    call sites that never varied it). `capture` controls whether `request()`
-    records the outgoing JSON body on `.last_body` (left None otherwise,
-    matching the call sites that never inspected it)."""
+    """Fake `_summarizer_conn()` return value. By default every
+    getresponse() emits a content_block_delta carrying `reply_text` plus a
+    message_delta carrying `stop_reason` (None => no message_delta). Pass
+    `replies=[{"text":..., "stop_reason":...}, ...]` to return different
+    bodies on successive getresponse() calls (consumed in order; the last
+    entry repeats once exhausted). `capture` records outgoing JSON bodies
+    on `.bodies` (list) and `.last_body` (most recent)."""
 
-    def __init__(self, reply_text: str = "summary", capture: bool = False):
+    def __init__(self, reply_text: str = "summary", capture: bool = False,
+                 stop_reason=None, replies=None):
         self.last_body = None
-        self._reply_text = reply_text
+        self.bodies = []
         self._capture = capture
+        if replies is not None:
+            self._replies = list(replies)
+        else:
+            self._replies = [{"text": reply_text, "stop_reason": stop_reason}]
+        self._idx = 0
 
     def request(self, method, path, body=None, headers=None):
         if self._capture:
-            self.last_body = json.loads(body)
+            parsed = json.loads(body)
+            self.bodies.append(parsed)
+            self.last_body = parsed
 
     def getresponse(self):
-        event = {"type": "content_block_delta", "delta": {"type": "text_delta", "text": self._reply_text}}
-        sse = f"data: {json.dumps(event)}\n\n".encode()
+        i = min(self._idx, len(self._replies) - 1)
+        self._idx += 1
+        reply = self._replies[i]
+        events = [{
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": reply["text"]},
+        }]
+        if reply.get("stop_reason") is not None:
+            events.append({
+                "type": "message_delta",
+                "delta": {"stop_reason": reply["stop_reason"]},
+            })
+        sse = "".join(f"data: {json.dumps(e)}\n\n" for e in events).encode()
         return FakeResponse(sse)
 
     def close(self):
