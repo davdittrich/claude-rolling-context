@@ -558,7 +558,7 @@ class RollingCompressor:
     # ------------------------------------------------------------------
 
     def _summarize_flattened(self, prompt: str, auth_headers: dict) -> str:
-        summary_max_tokens = 16000
+        summary_max_tokens = 20000
         model = self.summarizer_model or LEGACY_DEFAULT_MODEL
 
         if SUMMARIZER_FORMAT == "openai":
