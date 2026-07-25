@@ -44,6 +44,11 @@ class ParseSummarySseTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.comp._parse_summary_sse(body)
 
+    def test_error_event_raises(self):
+        body = _sse({"type": "error", "error": {"message": "boom"}})
+        with self.assertRaises(RuntimeError):
+            self.comp._parse_summary_sse(body)
+
 
 if __name__ == "__main__":
     unittest.main()

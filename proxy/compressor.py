@@ -551,6 +551,11 @@ class RollingCompressor:
                 f"chars={len(summary):,}) -> condense pass"
             )
             summary = self._condense_summary(summary, auth_headers, model)
+            if len(summary) > HARD_CEILING_TOKENS * 4:
+                log.warning(
+                    f"Summary still over budget after condense "
+                    f"({len(summary):,} chars)"
+                )
         return summary
 
     # ------------------------------------------------------------------
