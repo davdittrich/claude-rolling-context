@@ -43,5 +43,32 @@ class CondenseSummaryTest(unittest.TestCase):
         self.assertEqual(sent["max_tokens"], 20000)
 
 
+class _Non200Conn:
+    def request(self, *a, **k):
+        pass
+
+    def getresponse(self):
+        from _fakes import FakeResponse
+        return FakeResponse(b'{"error":"bad request"}', status=400)
+
+    def close(self):
+        pass
+
+
+class CondenseNon200Test(unittest.TestCase):
+    def setUp(self):
+        self._real = compressor._summarizer_conn
+        compressor._summarizer_conn = lambda timeout=600: _Non200Conn()
+
+    def tearDown(self):
+        compressor._summarizer_conn = self._real
+
+    def test_non_200_raises_with_status(self):
+        comp = compressor.RollingCompressor()
+        with self.assertRaises(RuntimeError) as ctx:
+            comp._condense_summary("x", auth_headers={}, model="claude-sonnet-4-5-20250929")
+        self.assertIn("400", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

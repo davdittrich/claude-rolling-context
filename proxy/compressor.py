@@ -439,6 +439,9 @@ class RollingCompressor:
         resp = conn.getresponse()
         resp_body = resp.read()
         conn.close()
+        if resp.status != 200:
+            err = resp_body.decode("utf-8", errors="replace")
+            raise RuntimeError(f"Summarization API returned {resp.status}: {err[:500]}")
         if resp_body[:2] == b"\x1f\x8b":
             resp_body = gzip.decompress(resp_body)
         text, _sr = self._parse_summary_sse(resp_body)
