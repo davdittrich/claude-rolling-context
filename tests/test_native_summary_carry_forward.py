@@ -1,8 +1,8 @@
 """Tests for Gemini-e86.11: reduce native summary drift via the PROMPT only.
 
 Invariant proven here: NATIVE_COMPACT_PROMPT mandates that a leading prior
-[ROLLING_CONTEXT_SUMMARY] block be carried forward VERBATIM and extended
-append-only, WITHOUT changing the span native sends (`messages[:cut]` stays
+[ROLLING_CONTEXT_SUMMARY] block be carried forward and extended with
+oldest-first Timeline decay, WITHOUT changing the span native sends
 byte-identical, preserving the prompt-cache read). This is a structural test:
 it proves the instruction text is present and that the assembled output still
 contains exactly one summary block. It does NOT assert "drift is reduced" —
@@ -25,16 +25,17 @@ from _fakes import FakeSummarizerConn  # noqa: E402
 class NativeCompactPromptTextTest(unittest.TestCase):
     """The prompt string itself must mandate verbatim carry-forward."""
 
-    def test_mandates_verbatim_carry_forward(self):
+    def test_mandates_oldest_first_decay(self):
         prompt = compressor.NATIVE_COMPACT_PROMPT
         self.assertIn(compressor.SUMMARY_MARKER, prompt)
-        self.assertIn("VERBATIM", prompt)
-        self.assertIn("APPEND", prompt)
+        self.assertIn("OLDEST", prompt)
+        self.assertIn("MERGE", prompt)
 
-    def test_forbids_paraphrasing_earlier_entries(self):
-        prompt = compressor.NATIVE_COMPACT_PROMPT.lower()
-        self.assertIn("never paraphrase", prompt)
-        self.assertIn("drop any entry", prompt)
+    def test_preserves_invariants_and_recent(self):
+        prompt = compressor.NATIVE_COMPACT_PROMPT
+        self.assertIn("Active Goal", prompt)
+        self.assertIn("Key Details", prompt)
+        self.assertIn("recent", prompt.lower())
 
 
 PRIOR_SUMMARY_TEXT = "PRIOR_SUMMARY_UNIQUE_MARKER_TOKEN: user asked for X, file foo.py changed."
@@ -98,7 +99,7 @@ class NativeCarryForwardStructuralTest(unittest.TestCase):
         # The compact instruction (containing the verbatim-carry-forward
         # mandate) must be present, byte-identical, as its own message.
         self.assertEqual(sent_messages[-1]["content"], compressor.NATIVE_COMPACT_PROMPT)
-        self.assertIn("VERBATIM", sent_messages[-1]["content"])
+        self.assertIn("OLDEST", sent_messages[-1]["content"])
 
     def test_assembled_output_has_exactly_one_summary_block(self):
         comp = compressor.RollingCompressor(keep_floor=2, keep_turns=2)

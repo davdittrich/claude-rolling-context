@@ -130,7 +130,12 @@ FORMAT:
 - [What's done, what's in progress, what's next]
 
 ## Key Details
-- [File paths, configs, decisions that must not be forgotten]"""
+- [File paths, configs, decisions that must not be forgotten]
+
+BUDGET & DECAY:
+- Keep the whole summary within ~16,000 tokens.
+- INVARIANTS — never condense or drop: the ## Active Goal section, any stated user constraints (do/don't rules), and the ## Key Details section.
+- The ## Timeline is the only section that may shrink. Keep the most recent ~15-20 steps detailed. As the summary approaches its budget, MERGE the OLDEST Timeline steps into denser milestone bullets rather than dropping the newest."""
 
 # Native mode: appended as the final user message after the real conversation,
 # like Claude Code's own /compact. Contains "context compressor" so test mocks
@@ -141,7 +146,7 @@ IMPORTANT: this compression request is NOT part of the conversation. Do not ment
 
 {SUMMARY_RULES}
 
-If the conversation begins with a {SUMMARY_MARKER} block from an earlier compression, treat it as fixed history: reproduce its Timeline and Key Details content VERBATIM, unchanged, in the new summary, and only APPEND the new events that happened after it. Never paraphrase, re-summarize, reorder, or drop any entry from that earlier block — copy it forward exactly, then extend it.
+If the conversation begins with a {SUMMARY_MARKER} block from an earlier compression, carry it forward and extend it. Preserve its ## Active Goal, stated user constraints, and ## Key Details at full fidelity — never condense or drop them. Keep recent ## Timeline entries detailed. As the combined summary approaches its ~16,000 token budget, MERGE the OLDEST Timeline entries into denser milestone bullets rather than dropping the newest events. Do not truncate the most recent entries.
 
 Write ONLY the chronological summary, nothing else."""
 
@@ -675,8 +680,11 @@ class RollingCompressor:
             if existing_summary:
                 existing_section = (
                     "EXISTING ROLLING SUMMARY FROM PREVIOUS COMPRESSIONS "
-                    "(integrate this timeline with the new conversation below — "
-                    "keep all details, extend the timeline):\n"
+                    "(carry it forward and extend it; preserve ## Active Goal, "
+                    "user constraints, and ## Key Details at full fidelity; as "
+                    "the summary nears ~16,000 tokens, merge the OLDEST Timeline "
+                    "entries into denser bullets rather than dropping the "
+                    "newest):\n"
                     f"{existing_summary}\n\n"
                 )
             prompt = SUMMARIZE_PROMPT.format(
