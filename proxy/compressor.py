@@ -425,7 +425,7 @@ class RollingCompressor:
         return summary, stop_reason
 
     def _condense_summary(self, summary_text: str, auth_headers: dict, model: str) -> str:
-        """Recursive backstop: re-summarize an over-budget summary under the
+        """Single-pass backstop: re-summarize an over-budget summary under the
         soft target, preserving invariants and folding the oldest Timeline.
         Uses a standalone request (no cache dependency — rare guard path)."""
         body = {
