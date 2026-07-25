@@ -57,6 +57,22 @@ Key properties fall straight out of the content-hash design:
 
 **Summarization is nearly free** in the default "native" mode. The proxy clones the session's own request (same model, system, tools, truncated at the cut), so Anthropic serves it as a [prompt-cache][cache] read: a few hundred fresh tokens to summarize a ~70K span, not a second full pass. Because the request keeps the session's own shape, it also clears the subscription-OAuth classifier that would 429 a naked side request.
 
+**Keeping the summary from saturating.** A rolling summary that only ever grows carries a failure mode inside it. The original contract told the summarizer to copy the previous summary forward unchanged and append the new events after it. Pair "copy forward, then append" with a fixed output cap and you get a trap: once the carried-forward text alone approaches the cap, there's no room left for the newest events, and since the old text is written first, it's the *newest* work that gets cut. The summary saturates and starts dropping the very turns it exists to protect. How often real sessions reached that ceiling was never billed or measured — but it's a structural certainty for any session long enough to fill the cap, not a tail risk.
+
+The fix swaps "copy forward, append" for **oldest-first decay** on a tiered contract. Three things never shrink: the Active Goal, the user's stated constraints, and the Key Details. Only the Timeline decays, and it decays from the *old* end. Recent steps stay detailed; as the summary nears its budget, the oldest steps merge into denser milestone bullets. The newest events are never the ones sacrificed.
+
+A prompt alone can't guarantee that, because it rests on the model obeying instructions. So the size bound lives in code, not in goodwill. Two budgets do the work: a ~16K-token soft target the prompt asks for, and a 20K-token hard ceiling set as the real `max_tokens`. After each summarization the proxy reads the API's `stop_reason`; if the model hit the token cap, or the returned summary still measures over the ceiling, it runs exactly one condense pass — re-summarizing under the same tiered contract, folding the oldest Timeline, keeping the invariants. One pass, never a loop. Both summarizer paths, the default native mode and the flattened fallback, carry the same guard.
+
+```mermaid
+flowchart TD
+    S[summarize old turns] --> P{truncated at cap<br/>OR over 20K ceiling?}
+    P -- no --> R[return summary]
+    P -- yes --> C[one condense pass:<br/>fold oldest Timeline,<br/>keep invariants]
+    C --> R
+```
+
+**What's proven, and what isn't.** The size bound is deterministic and tested: the guard fires on a truncated `stop_reason` and on an over-ceiling measurement, runs a single condense pass, and leaves a normal summary untouched — checked for the native summarizer and both flattened wire formats ([`test_summary_decay_guard.py`](../tests/test_summary_decay_guard.py), [`test_flattened_guard.py`](../tests/test_flattened_guard.py)), with the SSE `stop_reason` parse covered on its own ([`test_sse_stop_reason.py`](../tests/test_sse_stop_reason.py)). What a mock backend can't prove is the other half: that a real model, told to shed oldest-first, actually does. That waits on a live check — one long session run through repeated compressions, confirming from the proxy log that summary size settles at or below the soft target and the guard rarely fires. The code guarantees the summary stays bounded; the contract, not yet independently confirmed, is what aims that bound at the oldest material.
+
 ---
 
 ## 3. The keep policy: turns, not just tokens
@@ -128,6 +144,7 @@ On Pro/Max subscriptions none of this is dollars at all. The same prefix-size cu
 
 - **Quality under repetition, not raw spend, is the real differentiator.** Lowering Claude Code's own auto-compact threshold buys a similar *cost* curve for free. What it can't buy is the rolling-verbatim property: built-in compaction replaces the whole conversation each time it fires, so at a low threshold you're soon working from a summary of a summary. Rolling Context exists so aggressive compression doesn't cost you the session.
 - **It cannot preserve the prompt cache *and* clear server-side.** Anthropic's native [Context Editing][ctxedit] clears old tool results *after* cache lookup (cache-preserving) but only *drops* content, with no summary. This proxy summarizes, but rewrites client-side and so invalidates the cache. The two fight on the cache axis, and you can only have one owner of tool-output lifecycle. Combining them is future work behind a different architecture, not a config flag.
+- **The oldest-first contract leans on the model.** Code guarantees the summary can't grow past the ceiling; *which* material a tight compression sheds is the model following the decay prompt. The guard bounds size, not editorial judgment. If a summarizer ignores the contract and cuts the newest on its first pass, the condense pass re-summarizes already-truncated text and can't bring back what was dropped. The live-backend check (§2) is the honest gate before trusting that behavior.
 
 ---
 
@@ -156,6 +173,10 @@ On Pro/Max subscriptions none of this is dollars at all. The same prefix-size cu
 | Rolling compression orchestration | `proxy/compressor.py` → `RollingCompressor.compress` |
 | Blend keep-cut selection | `proxy/compressor.py` → `RollingCompressor._find_keep_index` |
 | Native (prompt-cached) summarization | `proxy/compressor.py` → `RollingCompressor._summarize_native` |
+| SSE parse + `stop_reason` capture | `proxy/compressor.py` → `RollingCompressor._parse_summary_sse` |
+| Summary decay guard (condense on truncation/over-ceiling) | `proxy/compressor.py` → `_summarize_native`, `_condense_summary` |
+| Flattened summarize + same guard | `proxy/compressor.py` → `_summarize_flattened`, `_summarize_flattened_once` |
+| Tiered-decay + condense prompts | `proxy/compressor.py` → `SUMMARY_RULES`, `NATIVE_COMPACT_PROMPT`, `CONDENSE_PROMPT` |
 | Install / `ANTHROPIC_BASE_URL` wiring | `hooks/start-proxy.sh`, `install.sh` |
 | Configuration (all env vars) | `README.md` → Configuration |
 | The economics, in full | `README.md` → "The economics: why capping the prefix matters" |
