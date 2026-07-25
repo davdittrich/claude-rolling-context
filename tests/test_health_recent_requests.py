@@ -44,11 +44,15 @@ class RecentRequestsRingBufferTest(unittest.TestCase):
         # newest first
         self.assertEqual([r["before_chars"] for r in recent], [4, 3, 2])
 
-    def test_exact_key_set_and_ts_is_number(self):
+    def test_exact_key_set_and_ts_is_iso_string(self):
+        import datetime
         server._record_request(100, 40, True, 25)
         rec = _health_json()["recent_requests"][0]
         self.assertEqual(set(rec), {"ts", "before_chars", "after_chars", "injected", "after_tokens"})
-        self.assertIsInstance(rec["ts"], (int, float))
+        # /health emits ts as an ISO 8601 local datetime string; internal record stays numeric.
+        self.assertIsInstance(rec["ts"], str)
+        datetime.datetime.fromisoformat(rec["ts"])  # parses or raises
+        self.assertIsInstance(server._recent_snapshot()[-1]["ts"], float)
         self.assertNotIn("before_tokens", rec)
 
 

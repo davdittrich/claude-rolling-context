@@ -1,6 +1,6 @@
 {
   "name": "rolling-context",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "Rolling context compression - old messages get summarized, recent messages stay verbatim. Never hit the context wall. Turn-aware keep policy + concurrency hardening (davdittrich fork).",
   "author": {
     "name": "davdittrich"

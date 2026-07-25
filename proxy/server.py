@@ -13,6 +13,7 @@ Pure stdlib — no external dependencies needed.
 """
 
 import collections
+import datetime
 import hashlib
 import json
 import os
@@ -416,6 +417,11 @@ def _recent_snapshot():
         return list(_recent_requests)
 
 
+def _iso(ts):
+    """Epoch seconds -> ISO 8601 local datetime string (e.g. 2026-07-25T16:30:00+02:00)."""
+    return datetime.datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -763,8 +769,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "total_tokens_saved": compressor.total_tokens_saved,
             "stored_compressions": len(store.compressions),
             "active_compressions": active,
-            "recent_requests": list(reversed(_recent_snapshot())),
-            "last_compression": compressor.last_compression,
+            "recent_requests": [
+                {**r, "ts": _iso(r["ts"])} for r in reversed(_recent_snapshot())
+            ],
+            "last_compression": (
+                {**compressor.last_compression,
+                 "ts": _iso(compressor.last_compression["ts"])}
+                if compressor.last_compression else None
+            ),
         }
         body = json.dumps(data).encode()
         self.send_response(200)

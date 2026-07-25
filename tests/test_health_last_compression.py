@@ -91,7 +91,11 @@ class HealthSurfacesLastCompressionTest(unittest.TestCase):
             sentinel = {"ts": 123.0, "before_chars": 900,
                         "after_chars": 300, "before_tokens": 250}
             server.compressor.last_compression = sentinel
-            self.assertEqual(_health_json()["last_compression"], sentinel)
+            out = _health_json()["last_compression"]
+            # /health formats ts to ISO 8601 local; other keys pass through.
+            self.assertEqual(out["ts"], server._iso(123.0))
+            self.assertEqual({k: out[k] for k in out if k != "ts"},
+                             {k: sentinel[k] for k in sentinel if k != "ts"})
         finally:
             server.compressor.last_compression = saved
 
