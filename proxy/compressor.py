@@ -98,6 +98,7 @@ def _clean_headers(headers: dict) -> dict:
 
 
 SUMMARY_MARKER = "[ROLLING_CONTEXT_SUMMARY]"
+HARD_CEILING_TOKENS = 20000  # native summary hard ceiling (max_tokens)
 SUMMARY_END_MARKER = "[/ROLLING_CONTEXT_SUMMARY]"
 
 SUMMARY_RULES = """RULES:
@@ -495,7 +496,7 @@ class RollingCompressor:
             compact_messages = convo + [{"role": "user", "content": NATIVE_COMPACT_PROMPT}]
 
         model = payload.get("model", LEGACY_DEFAULT_MODEL)
-        max_tokens = 16000
+        max_tokens = HARD_CEILING_TOKENS
         body = {
             "model": model,
             "max_tokens": max_tokens,
@@ -537,7 +538,14 @@ class RollingCompressor:
             error = resp_body.decode("utf-8", errors="replace")
             raise RuntimeError(f"Summarization API returned {resp.status}: {error[:500]}")
 
-        summary, _stop_reason = self._parse_summary_sse(resp_body)
+        summary, stop_reason = self._parse_summary_sse(resp_body)
+        over_ceiling = len(summary) > HARD_CEILING_TOKENS * 4  # ~4 chars/token estimate
+        if stop_reason == "max_tokens" or over_ceiling:
+            log.info(
+                f"Summary guard fired (stop_reason={stop_reason}, "
+                f"chars={len(summary):,}) -> condense pass"
+            )
+            summary = self._condense_summary(summary, auth_headers, model)
         return summary
 
     # ------------------------------------------------------------------
