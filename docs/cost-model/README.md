@@ -19,6 +19,8 @@ this directory.
 | `summ_rate.py` | Proxy vs. native `/compact`, and the cheaper-summarizer (Haiku/Sonnet) lever | `sessions.json` |
 | `length_cond.py` | Session-length distribution & conditional-remaining (why 100K, not lower) | `sessions.json` |
 | `adaptive.py` | Do turn/velocity-gated triggers beat a fixed 100K? (no, materially) | `sessions.json` |
+| `matched.py` | Proxy vs. native `/compact` at the SAME trigger — the fair comparison, since native's trigger is a knob | `sessions.json` |
+| `crossover.py` | Asymmetric break-even: fixed-100K proxy vs. a swept native trigger (~19% of 1M) | `sessions.json` |
 | `think_sens.py` | How do extended-thinking tokens move the savings? | Self-contained |
 | `profile_hash.py` | Is the proxy's own overhead material? (hash + TLS timing) | Live timing, imports `../../proxy/server.py` |
 
@@ -66,10 +68,13 @@ Your corpus will differ; re-run the scripts to recalibrate.
   `N=8 / hi=40K / floor=3` costs **$1,231 vs. $1,407** for flat `token-40k` — **−12.5%** at
   equal 5-turn coverage (99.3%), and it removes the flat policy's 15.5% "kept only one giant
   turn" coherence hazard (→ 0%). → brief §3, §4.
-- **Proxy vs. native `/compact` — not a cost saving** (`summ_rate.py` + `setpoint.py`): native
-  compaction fires at a **median 129K** in real transcripts (658 drops measured). Against it the
-  proxy is **~6–15% *more* expensive**, not cheaper — it keeps a verbatim tail and compacts more
-  often. The cheaper-summarizer lever (Haiku) would flip that on token billing, but is blocked on
+- **Proxy vs. native `/compact` — not a cost saving** (`matched.py`): native's auto-compact
+  trigger is configurable, so the fair comparison is at a **matched trigger** — and there native
+  is cheaper at *every* setting. Proxy premium **+23% at 100K**, ranging +6% (lax) to +47%
+  (aggressive). The proxy only "wins" by compacting *earlier* than native (`crossover.py`: they
+  cross near a 190K native trigger, ~19% of a 1M window) — but native is tunable, so that's not a
+  real edge. Native's *default* fires at a ~129K median (`setpoint.py`, 658 drops). The cheaper-
+  summarizer lever (Haiku, `summ_rate.py`) would flip it on token billing but is blocked on
   subscription OAuth. The old "~12% cheaper than native" figure came from a mislabeled baseline
   (a 40K-tail policy, not true native) and is retracted. → brief §5.
 - **Session length** (`length_cond.py`, `adaptive.py`): only ~28% of sessions ever reach 100K;
