@@ -28,6 +28,7 @@ import gzip
 import json
 import os
 import ssl
+import time
 import logging
 import http.client
 from urllib.parse import urlparse
@@ -197,6 +198,9 @@ class RollingCompressor:
         self.keep_floor = max(1, min(keep_floor, self.keep_turns))
         self.compression_count = 0
         self.total_tokens_saved = 0
+        # Most recent successful compression, for /health observability:
+        # {ts, before_chars, after_chars, before_tokens}. None until the first.
+        self.last_compression = None
 
     def _count_chars(self, messages: list) -> int:
         """Count total characters across all messages."""
@@ -786,5 +790,15 @@ class RollingCompressor:
                 f"{original_chars:,} -> {compressed_chars:,} chars "
                 f"(summary={summary_chars:,}, recent={recent_chars:,})"
             )
+
+        # Record this compression for /health. Chars are exact (both sides);
+        # before_tokens is the real trigger count (0 when unknown). No
+        # after-token: the post-compression token count is only an estimate.
+        self.last_compression = {
+            "ts": time.time(),
+            "before_chars": original_chars,
+            "after_chars": compressed_chars,
+            "before_tokens": real_token_count or 0,
+        }
 
         return compressed

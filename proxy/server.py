@@ -12,6 +12,7 @@ No sessions, no fingerprints — just content recognition.
 Pure stdlib — no external dependencies needed.
 """
 
+import collections
 import hashlib
 import json
 import os
@@ -43,6 +44,27 @@ logging.basicConfig(
 log = logging.getLogger("rolling-context")
 
 LISTEN_PORT = int(os.environ.get("ROLLING_CONTEXT_PORT") or "5588")
+
+
+def _load_version() -> str:
+    """Read the running proxy version from the canonical source.
+
+    .claude-plugin/plugin.json (one dir up from proxy/) is the single version
+    source of truth — the same file hooks/start-proxy.sh reads to detect a
+    version change and restart the proxy. Resolve it relative to __file__ so
+    it works regardless of the process cwd; never crash on a missing/malformed
+    file — report "unknown" instead.
+    """
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", ".claude-plugin", "plugin.json")
+        with open(path, encoding="utf-8") as f:
+            return (json.load(f) or {}).get("version") or "unknown"
+    except Exception:
+        return "unknown"
+
+
+PROXY_VERSION = _load_version()
 
 
 def _load_upstream() -> str:
@@ -364,6 +386,34 @@ class CompressionStore:
 
 
 store = CompressionStore()
+
+
+# Ring buffer of the last few requests routed through the proxy, for /health
+# observability: incoming vs forwarded context size per request. Bounded by
+# maxlen so it can never grow; lock-guarded on both write and read because
+# ThreadedHTTPServer runs each request on its own thread (mirrors the
+# CompressionStore lock discipline).
+_recent_requests = collections.deque(maxlen=3)
+_recent_lock = threading.Lock()
+
+
+def _record_request(before_chars, after_chars, injected, after_tokens):
+    """Append one routed-request record (newest last) under the lock."""
+    record = {
+        "ts": time.time(),
+        "before_chars": before_chars,
+        "after_chars": after_chars,
+        "injected": injected,
+        "after_tokens": after_tokens,
+    }
+    with _recent_lock:
+        _recent_requests.append(record)
+
+
+def _recent_snapshot():
+    """Stable list snapshot (oldest first) under the lock."""
+    with _recent_lock:
+        return list(_recent_requests)
 
 
 # ---------------------------------------------------------------------------
@@ -701,6 +751,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         )
         data = {
             "status": "ok",
+            "version": PROXY_VERSION,
             "trigger_tokens": TRIGGER_TOKENS,
             "target_tokens": TARGET_TOKENS,
             "keep_turns": compressor.keep_turns,
@@ -712,6 +763,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "total_tokens_saved": compressor.total_tokens_saved,
             "stored_compressions": len(store.compressions),
             "active_compressions": active,
+            "recent_requests": list(reversed(_recent_snapshot())),
+            "last_compression": compressor.last_compression,
         }
         body = json.dumps(data).encode()
         self.send_response(200)
@@ -746,6 +799,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Hash all messages for content-based matching
         msg_hashes = _hash_messages(messages)
         msg_chars = compressor._count_chars(messages)
+        incoming_chars = msg_chars  # "before" size, captured pre-injection
 
         log.info(
             f"[MSG] model={model} stream={is_streaming} "
@@ -911,6 +965,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             conn.close()
 
+            # Snapshot the REAL upstream token count BEFORE the char fallback
+            # below can overwrite total_input with an estimate — /health must
+            # report real tokens only (0 when upstream reported none).
+            real_after_tokens = total_input
+
             # Fallback: estimate tokens from chars if SSE didn't provide usage
             if total_input == 0 and msg_chars > 0:
                 total_input = msg_chars // 4  # rough chars-to-tokens estimate
@@ -918,6 +977,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     f"[MSG] No tokens from SSE, estimating from chars: "
                     f"{msg_chars:,} chars -> ~{total_input:,} tokens"
                 )
+
+            # Record this request for /health observability: incoming vs
+            # forwarded ("after") context size. after_tokens is the real
+            # upstream count captured above, never the char estimate.
+            _record_request(incoming_chars, msg_chars, injected, real_after_tokens)
 
             # Trigger compression based on token count. The minimum message
             # count keeps us from "compressing" sessions whose bulk is the

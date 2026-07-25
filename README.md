@@ -258,7 +258,13 @@ export ROLLING_CONTEXT_UPSTREAM=http://localhost:8080  # your existing proxy
 curl http://127.0.0.1:5588/health
 ```
 
-Returns compression stats: how many compressions, tokens saved, etc.
+Returns compression stats and runtime info. Fields include:
+
+- `version` — the running proxy version, read from `.claude-plugin/plugin.json` (`"unknown"` if unreadable).
+- `compression_count`, `total_tokens_saved`, `stored_compressions`, `active_compressions` — aggregate compression stats.
+- `recent_requests` — the last 3 routed requests, newest first. Each entry: `ts` (epoch seconds), `before_chars` (context received from Claude Code), `after_chars` (context forwarded upstream after any compressed-prefix injection; equals `before_chars` when nothing was injected), `injected` (bool), `after_tokens` (real upstream-reported input tokens for the forwarded request; `0` when upstream reported none — never an estimate).
+- `last_compression` — the most recent compression event, or `null` before any has run. Keys: `ts` (epoch seconds), `before_chars` and `after_chars` (exact context size in vs out of the compression), `before_tokens` (real token count that triggered it; `0` if unknown). No after-token count — compression output tokens are only estimable.
+- config echo: `trigger_tokens`, `target_tokens`, `keep_turns`, `keep_floor`, `summarizer_model`, `summarizer_mode`, `upstream_url`.
 
 ## Debug
 
