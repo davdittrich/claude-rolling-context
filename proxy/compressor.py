@@ -370,6 +370,45 @@ class RollingCompressor:
                         count += 1
         return count
 
+    def _parse_summary_sse(self, resp_body: bytes) -> tuple:
+        """Parse a native summarizer SSE body into (text, stop_reason).
+
+        stop_reason is captured from message_delta and is None if absent.
+        Raises RuntimeError on a stream error event or empty text.
+        """
+        parts = []
+        stop_reason = None
+        for line in resp_body.decode("utf-8", errors="replace").split("\n"):
+            if not line.startswith("data: "):
+                continue
+            try:
+                data = json.loads(line[6:])
+            except json.JSONDecodeError:
+                continue
+            evt = data.get("type", "")
+            if evt == "message_start":
+                usage = data.get("message", {}).get("usage", {})
+                log.info(
+                    f"Native compaction usage: input={usage.get('input_tokens', 0):,} "
+                    f"cache_read={usage.get('cache_read_input_tokens', 0):,} "
+                    f"cache_write={usage.get('cache_creation_input_tokens', 0):,}"
+                )
+            elif evt == "content_block_delta":
+                delta = data.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    parts.append(delta.get("text", ""))
+            elif evt == "message_delta":
+                sr = data.get("delta", {}).get("stop_reason")
+                if sr is not None:
+                    stop_reason = sr
+            elif evt == "error":
+                raise RuntimeError(f"Summarization stream error: {json.dumps(data)[:500]}")
+        summary = "".join(parts).strip()
+        if not summary:
+            snippet = resp_body.decode("utf-8", errors="replace")[:300]
+            raise RuntimeError(f"Summarization returned empty text; response starts: {snippet}")
+        return summary, stop_reason
+
     def _summarize_native(self, payload: dict, messages: list, cut: int, auth_headers: dict) -> str:
         """Send the session's own request shape with a compact instruction.
 
@@ -460,32 +499,7 @@ class RollingCompressor:
             error = resp_body.decode("utf-8", errors="replace")
             raise RuntimeError(f"Summarization API returned {resp.status}: {error[:500]}")
 
-        parts = []
-        for line in resp_body.decode("utf-8", errors="replace").split("\n"):
-            if not line.startswith("data: "):
-                continue
-            try:
-                data = json.loads(line[6:])
-            except json.JSONDecodeError:
-                continue
-            evt = data.get("type", "")
-            if evt == "message_start":
-                usage = data.get("message", {}).get("usage", {})
-                log.info(
-                    f"Native compaction usage: input={usage.get('input_tokens', 0):,} "
-                    f"cache_read={usage.get('cache_read_input_tokens', 0):,} "
-                    f"cache_write={usage.get('cache_creation_input_tokens', 0):,}"
-                )
-            elif evt == "content_block_delta":
-                delta = data.get("delta", {})
-                if delta.get("type") == "text_delta":
-                    parts.append(delta.get("text", ""))
-            elif evt == "error":
-                raise RuntimeError(f"Summarization stream error: {json.dumps(data)[:500]}")
-        summary = "".join(parts).strip()
-        if not summary:
-            snippet = resp_body.decode("utf-8", errors="replace")[:300]
-            raise RuntimeError(f"Summarization returned empty text; response starts: {snippet}")
+        summary, _stop_reason = self._parse_summary_sse(resp_body)
         return summary
 
     # ------------------------------------------------------------------
