@@ -222,6 +222,14 @@ from proxy import chain
 
 
 class IsSelfTest(unittest.TestCase):
+    def setUp(self):
+        # Hermetic: this machine may export ROLLING_CONTEXT_PORT. Without this the suite
+        # passes only when that value happens to equal the default it asserts against.
+        patch = mock.patch.dict(os.environ, {}, clear=False)
+        patch.start()
+        os.environ.pop("ROLLING_CONTEXT_PORT", None)
+        self.addCleanup(patch.stop)
+
     def test_our_own_url_is_self(self):
         self.assertTrue(chain.is_self("http://127.0.0.1:5588"))
 
