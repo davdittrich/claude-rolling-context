@@ -17,7 +17,7 @@ class CondenseSummaryTest(unittest.TestCase):
     def setUp(self):
         self._real = compressor._summarizer_conn
         self._fake = FakeSummarizerConn(reply_text="CONDENSED", capture=True)
-        compressor._summarizer_conn = lambda timeout=600: self._fake
+        compressor._summarizer_conn = lambda ep, timeout=600: self._fake
 
     def tearDown(self):
         compressor._summarizer_conn = self._real
@@ -58,7 +58,7 @@ class _Non200Conn:
 class CondenseNon200Test(unittest.TestCase):
     def setUp(self):
         self._real = compressor._summarizer_conn
-        compressor._summarizer_conn = lambda timeout=600: _Non200Conn()
+        compressor._summarizer_conn = lambda ep, timeout=600: _Non200Conn()
 
     def tearDown(self):
         compressor._summarizer_conn = self._real

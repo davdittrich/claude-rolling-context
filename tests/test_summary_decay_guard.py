@@ -23,7 +23,7 @@ MESSAGES = [
 class DecayGuardTest(unittest.TestCase):
     def _patch(self, fake):
         self._real = compressor._summarizer_conn
-        compressor._summarizer_conn = lambda timeout=600: fake
+        compressor._summarizer_conn = lambda ep, timeout=600: fake
         self.addCleanup(lambda: setattr(compressor, "_summarizer_conn", self._real))
 
     def test_truncation_triggers_one_condense_pass(self):

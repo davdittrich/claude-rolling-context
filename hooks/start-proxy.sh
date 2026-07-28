@@ -7,12 +7,19 @@ PROXY_DIR="$SCRIPT_DIR/../proxy"
 PIDFILE="$HOME/.claude/rolling-context-proxy.pid"
 VERFILE="$HOME/.claude/rolling-context-proxy.version"
 HOOKLOG="$HOME/.claude/rolling-context-hook.log"
+# Every diagnostic below redirects to $HOOKLOG. A missing or unwritable ~/.claude made
+# those redirections fail, which failed the command they were attached to -- the alert
+# turned into silence. A log sink must never be able to suppress the thing it logs.
+mkdir -p "$HOME/.claude" 2>/dev/null
+: 2>/dev/null >>"$HOOKLOG" || HOOKLOG=/dev/null  # stderr first: a failing redirect reports on the fd it already has
 PORT="${ROLLING_CONTEXT_PORT:-5588}"
 PROXY_URL="http://127.0.0.1:$PORT"
 CURRENT_VERSION=$(cat "$SCRIPT_DIR/../.claude-plugin/plugin.json" 2>/dev/null | grep '"version"' | head -1 | sed 's/.*"version".*"\(.*\)".*/\1/')
 
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$HOOKLOG"
+    # R1: every diagnostic goes to stderr AND the log. stdout belongs to the one
+    # JSON object SessionStart is allowed to emit (Fact 2), and nothing else.
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$HOOKLOG" >&2
 }
 
 # Detect Windows (git bash)
@@ -24,77 +31,108 @@ fi
 
 log "Hook started. PROXY_DIR=$PROXY_DIR IS_WINDOWS=$IS_WINDOWS"
 
-# Always update settings.json first (even if proxy is already running)
+# Who actually holds ANTHROPIC_BASE_URL, across every scope Claude Code reads.
+#
+# Root bug #2: this used to read only ~/.claude/settings.json, while `headroom wrap claude`
+# writes the project's .claude/settings.local.json -- which outranks it. The displacing value
+# was never in the file we looked at, so we printed "already" and went quiet.
+#
+# Root bug #1: the old guard was `elif "127.0.0.1" not in existing`, which called ANY loopback
+# address us. headroom on :8787 read as "already installed". Classification is now the one
+# shared predicate, chain.py is-self, which compares against the port we actually bind.
 SETTINGS_FILE="$HOME/.claude/settings.json"
-update_settings() {
-    local py_cmd=""
-    if [ "$IS_WINDOWS" = true ]; then
-        py_cmd="python"
-    elif command -v python3 &>/dev/null; then
-        py_cmd="python3"
-    else
-        py_cmd="python"
-    fi
+CHAIN="$PROXY_DIR/chain.py"
 
-    $py_cmd - "$SETTINGS_FILE" "$PROXY_URL" <<'PYEOF'
-import json, sys, os
+if [ "$IS_WINDOWS" = true ]; then
+    PY_CMD="python"
+elif command -v python3 &>/dev/null; then
+    PY_CMD="python3"
+else
+    PY_CMD="python"
+fi
 
-settings_file = sys.argv[1]
-proxy_url = sys.argv[2]
+# Seeds the plugin config defaults, and claims ANTHROPIC_BASE_URL only when passed "write".
+seed_settings() {
+    "$PY_CMD" - "$SETTINGS_FILE" "$PROXY_URL" "${1:-}" <<'PYSEED'
+import json, os, sys
+
+settings_file, proxy_url, mode = sys.argv[1], sys.argv[2], sys.argv[3]
 
 settings = {}
 if os.path.exists(settings_file):
     try:
-        with open(settings_file, "r") as f:
+        with open(settings_file, "r", encoding="utf-8") as f:
             settings = json.load(f)
-    except (json.JSONDecodeError, IOError):
-        settings = {}
+    except (json.JSONDecodeError, UnicodeDecodeError, IOError) as exc:
+        # Never regenerate a file we could not parse -- that silently discards the user's
+        # own settings. Leave it exactly as found and say so.
+        sys.stderr.write(f"refusing to rewrite {settings_file}: {exc}\n")
+        sys.exit(1)
 
-if "env" not in settings or not isinstance(settings["env"], dict):
+if not isinstance(settings.get("env"), dict):
     settings["env"] = {}
-
 env = settings["env"]
 
-# Set ANTHROPIC_BASE_URL
-existing = env.get("ANTHROPIC_BASE_URL", "")
-if not existing:
+if mode == "write":
     env["ANTHROPIC_BASE_URL"] = proxy_url
-    print("set")
-elif "127.0.0.1" not in existing:
-    env["ROLLING_CONTEXT_UPSTREAM"] = existing
-    env["ANTHROPIC_BASE_URL"] = proxy_url
-    print("chained")
-else:
-    print("already")
 
-# Set plugin config defaults (only if not already present)
-defaults = {
+# Plugin config defaults (only if not already present)
+for key, value in {
     "ROLLING_CONTEXT_PORT": "5588",
     "ROLLING_CONTEXT_TRIGGER": "100000",
     "ROLLING_CONTEXT_TARGET": "40000",
-}
-for key, value in defaults.items():
-    if key not in env:
-        env[key] = value
+}.items():
+    env.setdefault(key, value)
 
 # Unset ROLLING_CONTEXT_MODEL = compress with the session's own model
 # (prompt-cache hit). Migrate away the old seeded haiku default.
 if env.get("ROLLING_CONTEXT_MODEL") == "claude-haiku-4-5-20251001":
     del env["ROLLING_CONTEXT_MODEL"]
 
-with open(settings_file, "w") as f:
+with open(settings_file, "w", encoding="utf-8") as f:
     json.dump(settings, f, indent=2)
     f.write("\n")
-PYEOF
+PYSEED
 }
 
-RESULT=$(update_settings 2>/dev/null)
-case "$RESULT" in
-    set)     log "Set ANTHROPIC_BASE_URL=$PROXY_URL (settings.json)" ;;
-    chained) log "Chaining upstream (settings.json)" ;;
-    already) log "ANTHROPIC_BASE_URL already set (settings.json)" ;;
-    *)       log "WARNING: Could not update settings.json" ;;
-esac
+seed() {
+    if seed_settings "$1" 2>>"$HOOKLOG"; then
+        return 0
+    fi
+    log "WARNING: could not update $SETTINGS_FILE"
+    return 1
+}
+
+EFFECTIVE=$("$PY_CMD" "$CHAIN" effective-abu 2>>"$HOOKLOG")
+ABU_RC=$?
+ALERT=""
+
+if [ "$ABU_RC" -ne 0 ]; then
+    log "WARNING: could not resolve ANTHROPIC_BASE_URL — leaving settings untouched"
+elif [ -z "$EFFECTIVE" ]; then
+    seed write && log "Set ANTHROPIC_BASE_URL=$PROXY_URL ($SETTINGS_FILE)"
+elif "$PY_CMD" "$CHAIN" is-self "$EFFECTIVE" 2>>"$HOOKLOG"; then
+    seed
+    log "ANTHROPIC_BASE_URL already points at us ($EFFECTIVE)"
+else
+    # Foreign. Write nothing -- an automatic, unrecorded chain is invisible to any undo.
+    # The user gets one alert and one command; nothing here needs a restart.
+    seed
+    log "Displaced: $EFFECTIVE holds ANTHROPIC_BASE_URL — writing nothing"
+    ALERT=$("$PY_CMD" "$CHAIN" should-alert "$EFFECTIVE" 2>>"$HOOKLOG")
+fi
+
+if [ -z "$ALERT" ]; then
+    ALERT=$("$PY_CMD" "$CHAIN" drifted 2>>"$HOOKLOG")
+fi
+if [ -n "$ALERT" ]; then
+    printf '%s\n' "$ALERT"
+fi
+
+# Test seam: run the detection and seeding logic, then stop before starting anything.
+if [ -n "${ROLLING_CONTEXT_NO_START:-}" ]; then
+    exit 0
+fi
 
 # Check if proxy is already running
 _kill_pid() {

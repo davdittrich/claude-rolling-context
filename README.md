@@ -247,15 +247,45 @@ All settings via environment variables (all optional — defaults work great):
 
 ## Proxy Chaining
 
-Already using another proxy (model router, API gateway, etc.)? Rolling Context auto-detects this and chains through it:
+Already using another proxy (model router, API gateway, etc.)? Rolling Context detects this
+automatically, but it never rewrites your settings for you — chaining is always something you run.
 
 ```
 Claude Code  ──►  Rolling Context (:5588)  ──►  Your Proxy  ──►  Anthropic API
 ```
 
-If `ANTHROPIC_BASE_URL` is already set when you install, the plugin automatically saves it as `ROLLING_CONTEXT_UPSTREAM` and inserts itself in front. No manual config needed.
+**The alert.** If `ANTHROPIC_BASE_URL` already points somewhere else when a session starts (or
+install runs), Rolling Context is out of the request path and context compaction is not running —
+silently, unless you're told. A `SessionStart` alert names the fix:
 
-You can also set it explicitly:
+```
+[rolling-context] compaction is OFF this session — another proxy (...) holds ANTHROPIC_BASE_URL.
+  fix: /rolling-context:chain     check anytime: /rolling-context:status
+```
+
+The alert fires once per project/URL pair, and again if the chain is later overwritten or its
+target drifts underneath you.
+
+- **`/rolling-context:chain`** puts Rolling Context back in front. It records the URL that
+  displaced it, points `ANTHROPIC_BASE_URL` at Rolling Context's own port, and sets
+  `ROLLING_CONTEXT_UPSTREAM` to the displaced URL so requests still reach your original proxy —
+  just through Rolling Context first. It refuses, printing why and writing nothing, when: the
+  value is exported in your shell environment (settings can't safely override that); the target
+  isn't a loopback address (Rolling Context only chains to local proxies — never forwards your API
+  key off-machine); the value is set by managed-settings.json (an administrator policy);
+  `ROLLING_CONTEXT_UPSTREAM` is already set to something Rolling Context did not write
+  (remove it yourself first); the target uses Rolling Context's own port on a different
+  host (that reads as a misconfiguration, not a proxy worth chaining to); or
+  you're already chained somewhere else (run `/rolling-context:unchain` first).
+- **`/rolling-context:unchain`** gives back exactly what `chain` displaced, byte-for-byte, for the
+  current project.
+- **`/rolling-context:status`** reports, read-only: whether Rolling Context is currently in the
+  request path, what it's chained through, and — if compaction is off — the same fix hint.
+
+None of this needs a restart: the proxy resolves its upstream fresh on every request, so `chain`,
+`unchain`, or hand-editing `ROLLING_CONTEXT_UPSTREAM` all take effect on the very next request.
+
+You can also set the upstream explicitly, bypassing the alert entirely:
 ```bash
 export ROLLING_CONTEXT_UPSTREAM=http://localhost:8080  # your existing proxy
 ```
@@ -273,6 +303,9 @@ Returns compression stats and runtime info. Fields include:
 - `recent_requests` — the last 3 routed requests, newest first. Each entry: `ts` (ISO 8601 local datetime string, e.g. `2026-07-25T16:30:00+02:00`), `before_chars` (context received from Claude Code), `after_chars` (context forwarded upstream after any compressed-prefix injection; equals `before_chars` when nothing was injected), `injected` (bool), `after_tokens` (real upstream-reported input tokens for the forwarded request; `0` when upstream reported none — never an estimate).
 - `last_compression` — the most recent compression event, or `null` before any has run. Keys: `ts` (ISO 8601 local datetime string, e.g. `2026-07-25T16:30:00+02:00`), `before_chars` and `after_chars` (exact context size in vs out of the compression), `before_tokens` (real token count that triggered it; `0` if unknown). No after-token count — compression output tokens are only estimable.
 - config echo: `trigger_tokens`, `target_tokens`, `keep_turns`, `keep_floor`, `summarizer_model`, `summarizer_mode`, `upstream_url`.
+- `upstream_source` — where `upstream_url` came from: the path of your user settings file when that set it, `<environment>` when your shell exported it, or `(default)` when nothing set it and requests go straight to the API.
+- `chained` — `true` unless the resolved upstream is the default `api.anthropic.com` (i.e. Rolling Context is forwarding through another proxy).
+- `upstream_reachable` — `true` if a fast TCP probe to the upstream host:port succeeded.
 
 ## Debug
 
