@@ -50,6 +50,10 @@ rm -f "$CLAUDE_DIR/rolling-context-hook.log"
 # exist on disk when it runs.
 if [ -x "$CHAIN" ]; then
     "$CHAIN" unchain --all || echo "  WARNING: unchain --all failed; a project's ANTHROPIC_BASE_URL may still point at this proxy"
+else
+    echo "  WARNING: $CHAIN not found -- skipping unchain. If a project was chained, its"
+    echo "           ANTHROPIC_BASE_URL may still point at this proxy. Run chain.sh unchain --all"
+    echo "           from a checkout before deleting it."
 fi
 rm -f "$CLAUDE_DIR/rolling-context-proxy.json"
 

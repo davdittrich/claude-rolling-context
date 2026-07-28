@@ -82,6 +82,23 @@ class EffectiveValueTest(unittest.TestCase):
         self.assertEqual(value, "http://127.0.0.1:1111")
         self.assertEqual(source, path)
 
+    def test_home_local_settings_are_seen_when_there_is_no_project_root(self):
+        """cwd == $HOME yields no project root, but Claude Code still honours
+        $HOME/.claude/settings.local.json there and it outranks settings.json.
+
+        project_root() stops before $HOME to keep unchain from widening to --all's scope --
+        a write-side invariant. Applying it to the read side hid displacements written at
+        $HOME: the hook saw only settings.json, concluded we were still in the path, and
+        emitted no alert while Claude Code routed everything to the other proxy.
+        """
+        local = os.path.join(self.home, ".claude", "settings.local.json")
+        self._write(local, "http://127.0.0.1:8787")
+        self._write(os.path.join(self.home, ".claude", "settings.json"), "http://127.0.0.1:5588")
+        self.assertIsNone(chain.project_root(self.home))
+        value, source = chain.effective(KEY, chain.project_root(self.home))
+        self.assertEqual(value, "http://127.0.0.1:8787")
+        self.assertEqual(source, local)
+
 
 if __name__ == "__main__":
     unittest.main()

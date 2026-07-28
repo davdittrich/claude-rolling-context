@@ -93,6 +93,12 @@ def settings_scopes(project_root):
     if project_root:
         scopes.append(os.path.join(project_root, ".claude", "settings.local.json"))
         scopes.append(os.path.join(project_root, ".claude", "settings.json"))
+    else:
+        # project_root() stops before $HOME so unchain cannot widen to --all's scope. That is a
+        # WRITE-side invariant. On the read side Claude Code still honours
+        # $HOME/.claude/settings.local.json when the session's cwd is $HOME, and it outranks
+        # settings.json -- omitting it let a displacement written there go unseen, with no alert.
+        scopes.append(os.path.join(os.path.expanduser("~"), ".claude", "settings.local.json"))
     scopes.append(user_settings_path())
     return scopes
 
@@ -539,13 +545,12 @@ def do_unchain(project, all_=False):
             del records[key]
             did_anything = True
         state["abu"] = records
-
-        # Our own key is left set. Restoring ANTHROPIC_BASE_URL above already took this
-        # project out of the request path, so the upstream value is inert for it -- and
-        # another project may still be chained through it (D10). Only --all removes it,
-        # which is what uninstall passes and means "nothing is chained any more".
+        # Our own key is shared by every chained project, so it outlives a single unchain --
+        # another project may still be chained through it (D10). But once the last record is
+        # gone nothing owns it, and leaving it set would silently route the NEXT project that
+        # gets seeded to our port through a proxy it never asked for.
         upstream = state.get("upstream")
-        if upstream and all_:
+        if upstream and (all_ or not records):
             if _read_key(user_settings_path(), USER_KEY) == upstream["wrote"]:
                 _write_key(user_settings_path(), USER_KEY, None)
             else:

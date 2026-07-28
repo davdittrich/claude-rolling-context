@@ -125,6 +125,21 @@ class UnchainTest(unittest.TestCase):
         self.assertEqual(chain.do_unchain(real), 0)
         self.assertEqual(self._local_env(real)["ANTHROPIC_BASE_URL"], FOREIGN)
 
+    def test_plain_unchain_drops_our_key_once_no_project_is_chained(self):
+        """The shared key outlives a single unchain only while someone still owns it.
+
+        Left set with no records, it silently routes the NEXT project seeded to our port
+        through a proxy that project never asked for.
+        """
+        a = self._project("a")
+        chain.do_chain(a, assume_yes=True)
+        self.assertEqual(self._user_env()["ROLLING_CONTEXT_UPSTREAM"], FOREIGN)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(chain.do_unchain(a), 0)
+        self.assertNotIn("ROLLING_CONTEXT_UPSTREAM", self._user_env())
+        with open(os.path.join(a, ".claude", "settings.local.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["env"]["ANTHROPIC_BASE_URL"], FOREIGN)
+
 
 if __name__ == "__main__":
     unittest.main()
