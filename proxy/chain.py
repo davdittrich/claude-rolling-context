@@ -130,7 +130,7 @@ def effective(key, project_root):
 
 def main(argv):
     if not argv:
-        sys.stderr.write("usage: chain.py {is-self <url>|chain [--yes]|unchain [--all]|status}\n")
+        sys.stderr.write("usage: chain.py {is-self <url>|chain [--yes]|unchain [--all]|status|effective-abu|should-alert <url>|drifted}\n")
         return 1
     verb, rest = argv[0], argv[1:]
     if verb == "is-self":
@@ -163,6 +163,45 @@ def main(argv):
             return 2
         if value:
             print(value)
+        return 0
+    if verb == "should-alert":
+        # The hook's displacement branch. Prints at most one JSON object (spec section 8);
+        # silence means the pair was already alerted and our chain is not the thing displaced.
+        if not rest:
+            sys.stderr.write("usage: chain.py should-alert <url>\n")
+            return 1
+        url = rest[0]
+        try:
+            project = os.path.realpath(project_root(cwd) or cwd)
+            alert, kind = should_alert(project, url)
+            if not alert:
+                return 0
+            if kind == "displaced":
+                print(displaced_alert(url))
+                return 0
+            state = load_state()
+            record = (state.get("abu") or {}).get(project) or {}
+            through = (record.get("displaced")
+                       or (state.get("upstream") or {}).get("wrote") or url)
+            print(overwritten_alert(url, through))
+        except UnparseableSettings as e:
+            sys.stderr.write(f"cannot alert — {display(e.path)} is not valid JSON\n")
+            return 2
+        return 0
+    if verb == "drifted":
+        # ANTHROPIC_BASE_URL still points at us, so the displacement check sees nothing --
+        # but ROLLING_CONTEXT_UPSTREAM has moved and we are chaining somewhere unchosen.
+        try:
+            pair = drifted()
+            if pair is None:
+                return 0
+            old, new = pair
+            project = os.path.realpath(project_root(cwd) or cwd)
+            if _record_alert(load_state(), project, f"upstream {display(old)} -> {display(new)}"):
+                print(drift_alert(old, new))
+        except UnparseableSettings as e:
+            sys.stderr.write(f"cannot alert — {display(e.path)} is not valid JSON\n")
+            return 2
         return 0
     sys.stderr.write(f"unknown verb: {display(verb)}\n")
     return 1
@@ -274,6 +313,90 @@ def _write_key(path, key, value):
 
 def _read_key(path, key):
     return (read_settings(path).get("env") or {}).get(key)
+
+
+def _record_alert(state, project, key):
+    """True the first time this {project, key} pair is seen; records it and saves.
+
+    D8 keys the pair, not the URL alone: headroom binds a fixed port, so a URL-only key would
+    alert once in the lifetime of the install and stay silent in every project after the first.
+    """
+    seen = {(a["project"], a["url"]) for a in state.get("alerted") or []}
+    if (project, key) in seen:
+        return False
+    state.setdefault("alerted", []).append({"project": project, "url": key})
+    save_state(state)
+    return True
+
+
+def should_alert(project, url):
+    """(alert?, kind) for this session. Records the pair when it decides to alert."""
+    state = load_state()
+    ours = (state.get("abu") or {}).get(project)
+    if _record_alert(state, project, url):
+        return True, ("overwritten" if ours else "displaced")
+    if ours:
+        # We chained here and something took it back. Say so every time, in different words.
+        return True, "overwritten"
+    return False, None
+
+
+def drifted():
+    """(old, new) when ROLLING_CONTEXT_UPSTREAM changed underneath us, else None.
+
+    Invisible to the displacement check: ANTHROPIC_BASE_URL still points at us, so from that
+    angle nothing changed -- but we are now chaining somewhere the user did not choose.
+    """
+    state = load_state()
+    upstream = state.get("upstream")
+    if not upstream:
+        return None
+    live = (read_settings(user_settings_path()).get("env") or {}).get(USER_KEY)
+    return None if live == upstream["wrote"] else (upstream["wrote"], live)
+
+
+def _session_alert(context, message):
+    """The SessionStart contract (Fact 2, spec section 8): exactly one JSON object, two fields.
+
+    systemMessage so the user sees it, additionalContext so the model knows and can offer the
+    fix rather than working a degraded session unaware.
+    """
+    return json.dumps({
+        "hookSpecificOutput": {"hookEventName": "SessionStart",
+                               "additionalContext": context},
+        "systemMessage": message,
+    })
+
+
+def displaced_alert(url):
+    url = display(url)
+    return _session_alert(
+        "rolling-context is out of the request path this session; context compaction is not "
+        "running. The fix is /rolling-context:chain.",
+        f"[rolling-context] compaction is OFF this session — another proxy ({url}) holds "
+        f"ANTHROPIC_BASE_URL.\n  fix: /rolling-context:chain     "
+        f"check anytime: /rolling-context:status")
+
+
+def overwritten_alert(url, through):
+    url, through = display(url), display(through)
+    return _session_alert(
+        f"rolling-context was chained through {through} in this project, but something has since "
+        f"overwritten ANTHROPIC_BASE_URL and rolling-context is out of the request path again; "
+        f"context compaction is not running. Re-running /rolling-context:chain restores it.",
+        f"[rolling-context] your chain was overwritten — compaction is OFF this session. "
+        f"{url} holds ANTHROPIC_BASE_URL again.\n  fix: /rolling-context:chain     "
+        f"check anytime: /rolling-context:status")
+
+
+def drift_alert(old, new):
+    old = display(old)
+    new = display(new) if new else "unset"
+    return _session_alert(
+        f"rolling-context's chain target changed outside of /rolling-context:chain — was {old}, "
+        f"is now {new}. Verify this is intended, or re-run /rolling-context:chain.",
+        f"[rolling-context] chain target changed outside chain.sh: was {old}, now {new}.\n"
+        f"  check: /rolling-context:status     re-chain: /rolling-context:chain <url>")
 
 
 def _guards(project, state):

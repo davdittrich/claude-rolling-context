@@ -37,21 +37,29 @@ if command -v python3 &>/dev/null; then PY_CMD="python3"
 elif command -v python &>/dev/null; then PY_CMD="python"
 fi
 
-$PY_CMD - "$SETTINGS_FILE" "$PROXY_URL" <<'PYEOF'
-import json, sys, os
+$PY_CMD - "$SETTINGS_FILE" "$PROXY_URL" "$PROXY_DIR" <<'PYEOF'
+import json, os, sys
 
-settings_file = sys.argv[1]
-proxy_url = sys.argv[2]
+settings_file, proxy_url, proxy_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+
+# One predicate (spec section 9). The old guard here was `"127.0.0.1" not in existing`,
+# which classified any loopback address as ourselves -- exactly how a foreign proxy on
+# :8787 read as "already installed".
+sys.path.insert(0, proxy_dir)
+import chain
 
 settings = {}
 if os.path.exists(settings_file):
     try:
-        with open(settings_file, "r") as f:
+        with open(settings_file, "r", encoding="utf-8") as f:
             settings = json.load(f)
-    except (json.JSONDecodeError, IOError):
-        settings = {}
+    except (json.JSONDecodeError, UnicodeDecodeError, IOError) as exc:
+        # Regenerating a file we could not parse would discard the user's own settings.
+        print(f"  SKIPPED: {settings_file} is not valid JSON ({exc})")
+        print("  Fix it by hand and re-run this installer.")
+        sys.exit(0)
 
-if "env" not in settings or not isinstance(settings["env"], dict):
+if not isinstance(settings.get("env"), dict):
     settings["env"] = {}
 
 env = settings["env"]
@@ -60,12 +68,13 @@ existing = env.get("ANTHROPIC_BASE_URL", "")
 if not existing:
     env["ANTHROPIC_BASE_URL"] = proxy_url
     print(f"  Set ANTHROPIC_BASE_URL={proxy_url}")
-elif "127.0.0.1" not in existing:
-    env["ROLLING_CONTEXT_UPSTREAM"] = existing
-    env["ANTHROPIC_BASE_URL"] = proxy_url
-    print(f"  Chaining: ANTHROPIC_BASE_URL={proxy_url} -> upstream={existing}")
+elif chain.is_self(existing):
+    print(f"  ANTHROPIC_BASE_URL already points at rolling-context ({chain.display(existing)})")
 else:
-    print(f"  ANTHROPIC_BASE_URL already set")
+    # Write nothing. Chaining silently here is an unrecorded change no undo can see.
+    print(f"  ANTHROPIC_BASE_URL is held by {chain.display(existing)} — writing nothing.")
+    print("  rolling-context is out of the request path. To put it back, run")
+    print("  /rolling-context:chain inside a project (or hooks/chain.sh chain).")
 
 # Set plugin config defaults (only if not already present)
 defaults = {
@@ -82,12 +91,17 @@ for key, value in defaults.items():
 if env.get("ROLLING_CONTEXT_MODEL") == "claude-haiku-4-5-20251001":
     del env["ROLLING_CONTEXT_MODEL"]
 
-with open(settings_file, "w") as f:
+with open(settings_file, "w", encoding="utf-8") as f:
     json.dump(settings, f, indent=2)
     f.write("\n")
 
 print(f"  Settings written to {settings_file}")
 PYEOF
+
+# Test seam: run the detection and seeding logic, then stop before touching anything else.
+if [ -n "${ROLLING_CONTEXT_NO_START:-}" ]; then
+    exit 0
+fi
 
 # 3. Register plugin
 echo "[3/3] Registering Claude Code plugin..."
