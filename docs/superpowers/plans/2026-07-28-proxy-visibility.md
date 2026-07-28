@@ -678,8 +678,9 @@ own key, which has no displaced value because nothing else writes it. See spec s
 
 **Interfaces:**
 - Produces:
-  - `state_path() -> str`, `lock_path() -> str`
-  - `empty_state() -> dict` — `{"abu": None, "upstream": None, "alerted": []}`
+  - `state_path() -> str`
+  - `empty_state() -> dict` — `{"abu": {}, "upstream": None, "alerted": []}`; `abu` is a map
+    keyed by project path, `upstream` is a single object with no `displaced` field
   - `load_state() -> dict` — raises `UnparseableSettings` on bad JSON
   - `save_state(state) -> None` — atomic `os.replace`, mode `0600`
   (No lock. Atomic `os.replace` is the whole concurrency story — see §5 Writing rules.)
@@ -738,6 +739,17 @@ class StateIOTest(unittest.TestCase):
 
     def test_rewrite_keeps_mode_0600(self):
         chain.save_state(chain.empty_state())
+        chain.save_state(chain.empty_state())
+        self.assertEqual(stat.S_IMODE(os.stat(chain.state_path()).st_mode), 0o600)
+
+    def test_rewrite_tightens_a_loose_pre_existing_file(self):
+        # The mode test with teeth. tempfile.mkstemp already opens at 0600, so dropping the
+        # chmod leaves the other two mode tests green -- they assert a true property without
+        # isolating what produces it. This one fails against a plain in-place open(path, "w"),
+        # which would silently inherit 0644 from whatever put the file there.
+        with open(chain.state_path(), "w", encoding="utf-8") as f:
+            json.dump(chain.empty_state(), f)
+        os.chmod(chain.state_path(), 0o644)
         chain.save_state(chain.empty_state())
         self.assertEqual(stat.S_IMODE(os.stat(chain.state_path()).st_mode), 0o600)
 
@@ -814,7 +826,7 @@ def save_state(state):
 - [ ] **Step 4: Run and verify it passes**
 
   Run: `python3 -m unittest tests.test_state_io -v`
-  Expected: PASS, 7 tests.
+  Expected: PASS, 8 tests.
 
 - [ ] **Step 5: Commit**
 
