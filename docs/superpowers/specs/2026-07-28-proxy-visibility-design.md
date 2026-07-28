@@ -71,7 +71,10 @@ Measured in spike `Gemini-b9b.1`:
 managed  >  project-local  >  project-shared  >  user  >  process-env
 ```
 
-Process environment is the **weakest** scope. A foreign proxy that only sets child
+Process environment is the **weakest** scope, and `managed-settings.json` the
+strongest — an administrator policy that `chain` cannot win against, which is why §6
+refuses with `managed-scope` rather than writing a value that would never take
+effect. A foreign proxy that only sets child
 environment therefore cannot displace our user-scope value. Displacement can only
 originate in a settings *file* — which is the file we must write, at the scope we
 found it. Where to write is not a free choice.
@@ -172,9 +175,11 @@ and local proxy topology.
 ```json
 {
   "abu": {
-    "path": "/home/dd/proj/A/.claude/settings.local.json",
-    "wrote": "http://127.0.0.1:5588",
-    "displaced": "http://127.0.0.1:8787"
+    "/home/dd/proj/A": {
+      "path": "/home/dd/proj/A/.claude/settings.local.json",
+      "wrote": "http://127.0.0.1:5588",
+      "displaced": "http://127.0.0.1:8787"
+    }
   },
   "upstream": {"wrote": "http://127.0.0.1:8787"},
   "alerted": [{"project": "/home/dd/proj/A", "url": "http://127.0.0.1:8787"}]
@@ -183,10 +188,17 @@ and local proxy topology.
 
 Three fields, and the asymmetry between the first two is the whole design:
 
-- **`abu`** — `ANTHROPIC_BASE_URL` in a project's own settings file. The only key we
-  write that **someone else owns**, so the only one whose prior value we must give
-  back. `displaced` is what was there before us — headroom's value, in the case
-  this feature exists for.
+- **`abu`** — `ANTHROPIC_BASE_URL` in a project's own settings file, **keyed by
+  project path**. The only key we write that **someone else owns**, so the only one
+  whose prior value we must give back. `displaced` is what was there before us —
+  headroom's value, in the case this feature exists for.
+
+  The key matters: D10 permits two projects to be chained at once, and a single
+  unkeyed record would mean B's `chain` overwrites A's. A's `unchain` would then
+  find B's record, see B's file still holding our value, and write B's displaced URL
+  into **B's** settings — silently un-chaining a project the user never named, while
+  A stayed stranded pointing at us. This is a map lookup, not bookkeeping: `unchain`
+  reads its own project's entry and no other.
 - **`upstream`** — `ROLLING_CONTEXT_UPSTREAM` in `~/.claude/settings.json`. **Ours.**
   Nothing else writes it, so there is no displaced value and none is recorded.
   `wrote` exists only so the read-back guard and §8's drift check can tell our

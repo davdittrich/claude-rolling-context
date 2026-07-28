@@ -370,7 +370,9 @@ order is measured and recorded in §2 of the spec.
 **Interfaces:**
 - Consumes: nothing from Task 2 beyond the module.
 - Produces:
-  - `SETTINGS_SCOPES` — the ordered scope list, highest precedence first.
+  - `managed_settings_path()` — the administrator-policy file, highest precedence of all.
+  - `settings_scopes(project_root)` — the ordered scope list, highest precedence first; the process
+    environment is checked last, as the **weakest** scope per Fact 3.
   - `read_settings(path) -> dict` — parsed `env` block; raises `UnparseableSettings` on bad JSON.
   - `effective(key, project_root) -> tuple[str | None, str | None]` — `(value, source_path)`;
     `(None, None)` when unset everywhere. `source_path` is `"<environment>"` when the process
@@ -478,9 +480,18 @@ def user_settings_path():
     return os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
 
 
+def managed_settings_path():
+    """Administrator policy. Highest precedence of all, and unwinnable by a write."""
+    if sys.platform == "darwin":
+        return "/Library/Application Support/ClaudeCode/managed-settings.json"
+    if os.name == "nt":
+        return r"C:\ProgramData\ClaudeCode\managed-settings.json"
+    return "/etc/claude-code/managed-settings.json"
+
+
 def settings_scopes(project_root):
     """Files that can supply a value, highest precedence first (spec section 2, Fact 3)."""
-    scopes = []
+    scopes = [managed_settings_path()]
     if project_root:
         scopes.append(os.path.join(project_root, ".claude", "settings.local.json"))
         scopes.append(os.path.join(project_root, ".claude", "settings.json"))
@@ -500,15 +511,22 @@ def read_settings(path):
 
 
 def effective(key, project_root):
-    """(value, source_path) for key, or (None, None). Process environment wins (spec section 7)."""
-    from_env = os.environ.get(key)
-    if from_env:
-        return from_env, "<environment>"
+    """(value, source_path) for key, or (None, None).
+
+    Fact 3, measured: managed > project-local > project-shared > user > process-env. The process
+    environment is the WEAKEST scope, not the strongest -- a foreign proxy that only sets a child
+    environment cannot displace a settings-file value, which is exactly why displacement always
+    originates in a file. Checking the environment first would build the whole displacement
+    decision on a value Claude Code itself would not honour.
+    """
     for path in settings_scopes(project_root):
         env_block = read_settings(path).get("env") or {}
         value = env_block.get(key)
         if value:
             return value, path
+    from_env = os.environ.get(key)
+    if from_env:
+        return from_env, "<environment>"
     return None, None
 ```
 
@@ -657,9 +675,9 @@ class StateIOTest(unittest.TestCase):
 
     def test_round_trip_both_fields(self):
         state = chain.empty_state()
-        state["abu"] = {"path": "/p/.claude/settings.local.json",
-                        "wrote": "http://127.0.0.1:5588",
-                        "displaced": "http://127.0.0.1:8787"}
+        state["abu"] = {"/p": {"path": "/p/.claude/settings.local.json",
+                               "wrote": "http://127.0.0.1:5588",
+                               "displaced": "http://127.0.0.1:8787"}}
         state["upstream"] = {"wrote": "http://127.0.0.1:8787"}
         chain.save_state(state)
         self.assertEqual(chain.load_state(), state)
@@ -721,7 +739,7 @@ def state_path():
 def empty_state():
     """abu: the key someone else owns, so it carries what we displaced.
     upstream: our own key, so it carries only who is still chained through it."""
-    return {"abu": None, "upstream": None, "alerted": []}
+    return {"abu": {}, "upstream": None, "alerted": []}
 
 
 def load_state():
@@ -772,7 +790,11 @@ The user-visible fix. `chain` is the single command from R2; `unchain` gives bac
 
 **Files:**
 - Modify: `proxy/chain.py`
-- Test: `tests/test_chain_verb.py`, `tests/test_unchain_verb.py`, `tests/test_status_verb.py`
+- Create: `hooks/chain.sh` — the D6 entry point. The dead-upstream error in Task 7 tells the user
+  to run `bash <resolved>/hooks/chain.sh unchain`, so this file must exist or that instruction
+  fails with "no such file or directory" at the exact moment the upstream is dead.
+- Test: `tests/test_chain_verb.py`, `tests/test_unchain_verb.py`, `tests/test_status_verb.py`,
+  `tests/test_entry_point.py`
 
 **Interfaces:**
 - Consumes: `is_self`, `effective`, `display`, `load_state`, `save_state`, `locked`,
@@ -842,8 +864,8 @@ class ChainVerbTest(unittest.TestCase):
         self._displace()
         chain.do_chain(self.project, assume_yes=True)
         state = chain.load_state()
-        self.assertEqual(state["abu"]["displaced"], FOREIGN)
-        self.assertEqual(state["abu"]["path"], self.local)
+        self.assertEqual(state["abu"][self.project]["displaced"], FOREIGN)
+        self.assertEqual(state["abu"][self.project]["path"], self.local)
         self.assertEqual(state["upstream"]["wrote"], FOREIGN)
         self.assertNotIn("displaced", state["upstream"])
 
@@ -1174,6 +1196,10 @@ def _guards(project, state):
                       f"rolling-context only chains to local proxies "
                       f"(127.0.0.1/::1/localhost); chaining elsewhere would forward your "
                       f"API key off-machine")
+    if source == managed_settings_path():
+        raise Refusal("managed-scope",
+                      f"{display(value)} is set by managed-settings.json — an administrator "
+                      f"policy, not something rolling-context can override")
     if urlparse(value).port == our_bind()[1]:
         raise Refusal("same-port-different-host",
                       f"{display(value)} uses our own port on a different host — refusing, "
@@ -1212,7 +1238,10 @@ def do_chain(project, assume_yes=False):
             return 2
 
         ours = f"http://127.0.0.1:{our_bind()[1]}"
-        state["abu"] = {"path": source, "wrote": ours, "displaced": url}
+        # Keyed by project: D10 allows two chained at once, and an unkeyed record would let
+        # B's chain overwrite A's, after which A's unchain would restore B's displaced value
+        # into B's file -- un-chaining a project the user never named.
+        state.setdefault("abu", {})[project] = {"path": source, "wrote": ours, "displaced": url}
         state["upstream"] = {"wrote": url}
         save_state(state)
 
@@ -1245,14 +1274,17 @@ def do_unchain(project, all_=False):
             print("nothing project-scoped to unchain here")
             return 0
 
-        # Give back the key someone else owns.
-        abu = state.get("abu")
-        if abu:
+        # Give back the key someone else owns -- this project's record and no other.
+        records = state.get("abu") or {}
+        targets = list(records) if all_ else ([root] if root in records else [])
+        for key in targets:
+            abu = records[key]
             if _read_key(abu["path"], ABU_KEY) == abu["wrote"]:
                 _write_key(abu["path"], ABU_KEY, abu["displaced"])
             else:
                 print(f"skipped {display(abu['path'])} — {ABU_KEY} is no longer ours")
-            state["abu"] = None
+            del records[key]
+        state["abu"] = records
 
         # Our own key is left set. Restoring ANTHROPIC_BASE_URL above already took this
         # project out of the request path, so the upstream value is inert for it -- and
@@ -1343,11 +1375,50 @@ def main(argv):
   Run: `python3 -m unittest tests.test_chain_verb tests.test_unchain_verb tests.test_status_verb -v`
   Expected: PASS, 23 tests.
 
+- [ ] **Step 4b: Create the entry point every message names**
+
+```bash
+#!/usr/bin/env bash
+# The single implementation entry point (D6). Slash commands and the dead-upstream
+# error body both route through this, so its path is load-bearing user-facing text.
+set -euo pipefail
+exec python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")/../proxy" && pwd)/chain.py" "$@"
+```
+
+```python
+# tests/test_entry_point.py -- the file the error message names must exist and work.
+import os, re, subprocess, unittest
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+class EntryPointTest(unittest.TestCase):
+    def test_chain_sh_exists_and_is_executable(self):
+        path = os.path.join(REPO, "hooks", "chain.sh")
+        self.assertTrue(os.path.exists(path))
+        self.assertTrue(os.access(path, os.X_OK))
+
+    def test_it_routes_to_the_python_implementation(self):
+        out = subprocess.run(["bash", os.path.join(REPO, "hooks", "chain.sh"),
+                              "is-self", "http://127.0.0.1:5588"],
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0)
+
+    def test_every_path_named_in_an_error_message_exists(self):
+        # The dead-upstream body names hooks/chain.sh. If that ever moves, this fails.
+        with open(os.path.join(REPO, "proxy", "server.py"), encoding="utf-8") as f:
+            src = f.read()
+        for rel in set(re.findall(r"hooks/[a-z-]+\.sh", src)):
+            self.assertTrue(os.path.exists(os.path.join(REPO, rel)), f"{rel} is named but missing")
+```
+
+  `chmod +x hooks/chain.sh`.
+
 - [ ] **Step 5: Commit**
 
 ```bash
-git add proxy/chain.py tests/test_chain_verb.py tests/test_unchain_verb.py tests/test_status_verb.py
-git commit -m "feat(chain): chain, unchain and status verbs"
+git add proxy/chain.py hooks/chain.sh tests/test_chain_verb.py tests/test_unchain_verb.py \
+        tests/test_status_verb.py tests/test_entry_point.py
+git commit -m "feat(chain): chain, unchain and status verbs behind hooks/chain.sh"
 ```
 
 ---
@@ -1365,6 +1436,11 @@ writes settings that the running proxy never reads, and R3 (no restart) is unrea
   `:767`, `:865`, `:869`, `:1065`, and the response-header logging at `:642` and `:877`
 - Modify: `proxy/compressor.py:38-40`, `:56-60`, `:445`, `:532`, `:583`, `:593` — the summarizer,
   which is the compaction path this plugin exists for and freezes exactly like `server.py` does
+- Modify: `tests/_fakes.py:138` — `make_handler(body)` takes no `headers` argument today, and the
+  loop-protection tests below pass one. Extend the signature to
+  `make_handler(body: bytes, headers: dict | None = None)`, merging the supplied names into the
+  `Message()` it already builds. Without this the three loop tests fail with `TypeError` before
+  reaching any loop-protection logic.
 - Test: `tests/test_upstream_reaches_socket.py`, `tests/test_server_upstream.py`,
   `tests/test_dead_upstream.py`, `tests/test_summarizer_follows.py`,
   `tests/test_loop_protection.py`, `tests/test_response_header_logging.py`,
@@ -1489,7 +1565,12 @@ if __name__ == "__main__":
   In `proxy/server.py`, delete the module-level `UPSTREAM_URL`, `_parsed_upstream` and
   `UPSTREAM_PATH` constants and add:
 
+`server.py` runs with `proxy/` as its working directory (`hooks/start-proxy.sh` does
+`cd "$PROXY_DIR"`), so `chain` is a sibling module — import it plainly, and add the import at the
+top of the file alongside the existing ones:
+
 ```python
+import chain            # sibling module: proxy/chain.py
 import collections
 
 Upstream = collections.namedtuple("Upstream", "scheme host port path")
@@ -1541,8 +1622,10 @@ def current_upstream():
         parsed = urlparse("https://api.anthropic.com")
     # D18: a file-sourced upstream must be loopback. An exported variable is the user acting
     # deliberately in their own shell and is exempt.
-    if not from_env and parsed.hostname is not None \
-            and parsed.hostname != "api.anthropic.com" \
+    # A malformed file-sourced value parses to hostname=None. That is exactly the hand-edit D18
+    # exists to catch, so it must refuse rather than fall through to Upstream(host=None) and die
+    # later as an unhandled exception.
+    if not from_env and parsed.hostname != "api.anthropic.com" \
             and not chain.host_matches(parsed.hostname, "127.0.0.1"):
         raise UpstreamRefused(raw, chain.user_settings_path())
 
@@ -1661,6 +1744,11 @@ def test_cache_invalidates_on_mtime_change(self):
     self.assertEqual(server.current_upstream().port, A)
     self._point_at(B)
     self.assertEqual(server.current_upstream().port, B)
+
+def test_a_malformed_file_sourced_value_is_refused_not_forwarded(self):
+    self._write_user_settings({"ROLLING_CONTEXT_UPSTREAM": "not-a-url"})
+    with self.assertRaises(server.UpstreamRefused):
+        server.current_upstream()
 
 def test_our_own_address_falls_through_to_the_default_api(self):
     self._write_user_settings({"ROLLING_CONTEXT_UPSTREAM": f"http://127.0.0.1:{server.LISTEN_PORT}"})
