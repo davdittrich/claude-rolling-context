@@ -13,7 +13,7 @@
 - **Pure stdlib.** `proxy/chain.py` must import cleanly on Windows — no `fcntl`, no third-party imports.
 - **Every new test must be mutation-proven.** Break the behaviour, confirm THAT test fails by name, restore the file, prove the restore with sha256. A test never seen failing is not evidence.
 - **Verify the mutation landed** (hash or diff the file) before reading a green suite as a test gap. A prior session misread a silent no-op mutation as a missing test.
-- **Suite must be green in three environments:** plain; `ANTHROPIC_BASE_URL=http://127.0.0.1:8787 ROLLING_CONTEXT_PORT=8787`; and `ROLLING_CONTEXT_SUMMARIZER_URL=http://127.0.0.1:9999`. The third is currently red with 6 failures and becomes green in Task 2 — that is Task 2's acceptance test.
+- **Suite must be green in two environments:** plain, and `ANTHROPIC_BASE_URL=http://127.0.0.1:8787 ROLLING_CONTEXT_PORT=8787`. A third, `ROLLING_CONTEXT_SUMMARIZER_URL=http://127.0.0.1:9999`, is red with 6 failures and **stays red until Task 6** — see the correction in Task 2.
 - **Baseline is 233 passed, 7 subtests** at commit `09ff584`.
 - **Tool constraint:** `Read`/`Grep`/`Glob` are denied in this repo. Use `mcp__plugin_context-mode_context-mode__ctx_execute` (python or shell) for all file reading and editing. `Edit` will not work — it requires a prior in-session `Read`. To edit: read in python, `assert text.count(old) == 1`, `text.replace(old, new)`, write back.
 - **Commits:** Conventional Commits with the why. No emojis, no AI attribution, no `Co-Authored-By`. Never `--no-verify`.
@@ -256,14 +256,25 @@ Rewrite each to call `comp.native_mode()`. The two `srv.NATIVE_MODE` assertions 
 
 Preserve every existing behavioural assertion: the point of these tests is that a pinned model or a custom summarizer URL disables native mode. Only the mechanism being asserted changes, never the expected truth value.
 
-- [ ] **Step 5: Run all three environments**
+- [ ] **Step 5: Run the two required environments**
 
 ```bash
 python3 -m pytest tests/ -q
 env ANTHROPIC_BASE_URL=http://127.0.0.1:8787 ROLLING_CONTEXT_PORT=8787 python3 -m pytest tests/ -q
-env ROLLING_CONTEXT_SUMMARIZER_URL=http://127.0.0.1:9999 python3 -m pytest tests/ -q
 ```
-Expected: all three green. The third is this task's acceptance test.
+Expected: both green.
+
+**CORRECTION — the original acceptance test for this task was wrong.** This plan claimed the 6
+failures under `ROLLING_CONTEXT_SUMMARIZER_URL` were caused by the import-frozen flag and would go
+green here. They do not. Verified: with `native_mode()` in place the same 6 still fail, and those
+three test files (`test_compress_accounting.py`, `test_health_last_compression.py`,
+`test_native_summary_carry_forward.py`) reference `NATIVE_MODE` / `native_mode` /
+`SUMMARIZER_URL` exactly zero times. They implicitly assume native mode and break when the
+variable is genuinely exported process-wide — true whether the flag is frozen or fresh.
+
+This task is therefore justified on its own merits (the daemon is reused, so a flag captured at
+import outlives its configuration) and **not** on fixing those 6 tests. The hermeticity gap is
+Task 6.
 
 - [ ] **Step 6: Mutation-prove**
 
@@ -517,4 +528,52 @@ Neither arm was exercised. The originally-reported trigger, a CRLF in the URL,
 does not reach them -- Python strips \\r and \\n -- so the test uses inputs that
 genuinely fail to parse: a malformed IPv6 literal, and ports that are
 non-numeric, out of range, or space-padded."
+```
+
+---
+
+### Task 6: Make three test files hermetic against ROLLING_CONTEXT_SUMMARIZER_URL
+
+**Files:**
+- Modify: `tests/test_compress_accounting.py`, `tests/test_health_last_compression.py`, `tests/test_native_summary_carry_forward.py`
+
+**Interfaces:** No source changes. `tests/_fakes.py` already provides `hermetic_home(testcase)`, which pops `ANTHROPIC_BASE_URL`, `ROLLING_CONTEXT_UPSTREAM`, `ROLLING_CONTEXT_PORT` and `ROLLING_CONTEXT_SUMMARIZER_URL`.
+
+**Why:** These six tests exercise the native-mode compression path but never force native mode. When `ROLLING_CONTEXT_SUMMARIZER_URL` is exported process-wide — a documented, supported variable — native mode is correctly off and the tests fail. This was misdiagnosed in Task 2 as a frozen-flag problem; it is not. The three files reference the flag zero times.
+
+- [ ] **Step 1: Confirm the failures and their independence from the flag**
+
+Run: `env ROLLING_CONTEXT_SUMMARIZER_URL=http://127.0.0.1:9999 python3 -m pytest tests/ -q`
+Expected: exactly 6 failures, two in each of the three files.
+
+- [ ] **Step 2: Make each test class hermetic**
+
+In each of the three files, ensure the `setUp` strips `ROLLING_CONTEXT_SUMMARIZER_URL` from the environment for the duration of the test, using the same `mock.patch.dict` + `os.environ.pop` + `addCleanup(patch.stop)` pattern the rest of the suite uses. Prefer calling the existing `hermetic_home(self)` helper from `tests/_fakes.py` if the file already imports from `_fakes` or can do so without disturbing its other fixtures; otherwise add the minimal pop.
+
+Do not change what any test asserts. The tests are correct; only their isolation is missing.
+
+- [ ] **Step 3: Verify all three environments**
+
+```bash
+python3 -m pytest tests/ -q
+env ANTHROPIC_BASE_URL=http://127.0.0.1:8787 ROLLING_CONTEXT_PORT=8787 python3 -m pytest tests/ -q
+env ROLLING_CONTEXT_SUMMARIZER_URL=http://127.0.0.1:9999 python3 -m pytest tests/ -q
+```
+Expected: all three green. The third is this task's acceptance test.
+
+- [ ] **Step 4: Mutation-prove the isolation**
+
+Remove the new pop from one file, run under the third environment, confirm that file's two tests fail again, restore, prove with sha256.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add tests/test_compress_accounting.py tests/test_health_last_compression.py tests/test_native_summary_carry_forward.py
+git commit -m "test: isolate three suites from ROLLING_CONTEXT_SUMMARIZER_URL
+
+These six tests exercise the native-mode compression path but never force
+native mode, so exporting a documented, supported variable turned them red.
+Misdiagnosed earlier as a frozen-flag problem: the three files reference the
+flag zero times, and they fail identically whether it is frozen or computed
+per call."
 ```
