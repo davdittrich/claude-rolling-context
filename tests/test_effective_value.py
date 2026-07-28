@@ -68,6 +68,20 @@ class EffectiveValueTest(unittest.TestCase):
             json.dump({"permissions": {}}, f)
         self.assertEqual(chain.effective(KEY, self.project), (None, None))
 
+    def test_environment_supplies_the_value_when_no_file_does(self):
+        with mock.patch.dict(os.environ, {KEY: "http://127.0.0.1:3333"}):
+            value, source = chain.effective(KEY, self.project)
+        self.assertEqual(value, "http://127.0.0.1:3333")
+        self.assertEqual(source, "<environment>")
+
+    def test_file_value_beats_environment_value(self):
+        path = os.path.join(self.home, ".claude", "settings.json")
+        self._write(path, "http://127.0.0.1:1111")
+        with mock.patch.dict(os.environ, {KEY: "http://127.0.0.1:9999"}):
+            value, source = chain.effective(KEY, self.project)
+        self.assertEqual(value, "http://127.0.0.1:1111")
+        self.assertEqual(source, path)
+
 
 if __name__ == "__main__":
     unittest.main()
