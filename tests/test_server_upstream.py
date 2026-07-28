@@ -58,6 +58,11 @@ class ServerUpstreamTest(unittest.TestCase):
             server.current_upstream()
         self.assertEqual(ctx.exception.path, chain.user_settings_path())
 
+    def test_an_unchained_proxy_reports_the_default_source(self):
+        # Commonest runtime value of the field: nothing in env, nothing in the
+        # settings file, so the upstream came from neither.
+        self.assertEqual(server.current_upstream().source, "(default)")
+
 
 if __name__ == "__main__":
     unittest.main()

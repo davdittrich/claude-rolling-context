@@ -83,6 +83,18 @@ class HealthChainFieldsTest(unittest.TestCase):
         self.assertFalse(data["upstream_reachable"])
         self.assertIn("not valid JSON", data["upstream_url"])
         self.assertEqual(data["upstream_source"], path)
+        # Never claim a chain we just said we cannot read.
+        self.assertFalse(data["chained"])
+
+    def test_health_reports_the_refusal_when_the_upstream_is_refused(self):
+        # A D18 refusal is what the `status` verb renders; all three fields of
+        # that arm are load-bearing, so pin each one.
+        self._write_user_settings({"ROLLING_CONTEXT_UPSTREAM": "https://proxy.example.com"})
+        data = _health_json()
+        self.assertEqual(data["upstream_url"], "(refused: not-loopback)")
+        self.assertEqual(data["upstream_source"], chain.user_settings_path())
+        self.assertTrue(data["chained"])
+        self.assertFalse(data["upstream_reachable"])
 
 
 if __name__ == "__main__":

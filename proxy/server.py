@@ -1248,6 +1248,13 @@ def main():
         log.info(f"  Forwarding to: {_startup_upstream.scheme}://{_startup_upstream.host}:{_startup_upstream.port}")
     except UpstreamRefused as e:
         log.warning(f"  Upstream refused at startup: {e}")
+    except chain.UnparseableSettings as e:
+        # Startup must degrade the way /health does: a hand-broken settings.json
+        # is a diagnostic, never a reason for the daemon not to exist. The
+        # upstream is re-resolved per request, so a later fix needs no restart.
+        log.warning(
+            f"  Upstream unresolved at startup: {chain.display(e.path)} is not valid JSON"
+            f" -- serving anyway")
     log.info(f"  Matching: content-based (no sessions/fingerprints)")
 
     server = ThreadedHTTPServer(("127.0.0.1", LISTEN_PORT), ProxyHandler)
