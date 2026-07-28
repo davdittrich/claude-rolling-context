@@ -331,7 +331,15 @@ Each traces to a specific past failure:
 
 - Lock scope: the state-file lock is held from before guard evaluation through
   both settings writes, both read-backs, and the state-file write — not narrowly
-  around the `alerted` append. D10 explicitly permits concurrent `chain` calls
+  around the `alerted` append.
+  This means `chain`'s confirmation prompt (D14) is inside the lock, so a session
+  left sitting at the `y/N` prompt blocks a concurrent `chain` or `unchain` in
+  another project until someone answers. Accepted: it cannot hang a script, since
+  a non-interactive caller without `--yes` refuses immediately rather than
+  prompting, and the alternative — confirm outside the lock, then acquire it and
+  re-evaluate every guard before writing — buys freedom from human latency at the
+  cost of a second guard pass and two places where guard results can disagree. Not
+  worth it for a prompt a person is looking at. D10 explicitly permits concurrent `chain` calls
   from different projects; without this scope two concurrent applies can
   interleave their read-backs against each other's writes.
 - POSIX: `fcntl.flock` on the state file, held for the scope above. Windows has
