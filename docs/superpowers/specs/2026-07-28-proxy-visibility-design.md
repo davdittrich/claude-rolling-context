@@ -310,9 +310,19 @@ the fix is one `chain` away. A pinned key that never restores has no such
 self-announcing failure, which is why the prune is the safer default.
 
 Because `status` does not prune, a machine whose *only* chained project was deleted
-keeps the key set until someone runs `chain` or `unchain` again. `status` says so
-in as many words and names the remedy, so this is a visible resting state rather
-than the silent one the prune exists to prevent.
+keeps the key set until someone runs `chain` or `unchain` again. That state is
+louder than it first sounds, and deliberately so: `ROLLING_CONTEXT_UPSTREAM` is
+machine-wide, so once the pin is stale **every** project routed through the daemon
+gets D9's dead-upstream error — including projects that never ran `chain` and have
+no entry in `refs`. The failure announces itself to everyone sharing the daemon
+rather than degrading one project quietly.
+
+It also heals from anywhere. `unchain` run in such an unrelated project still
+reaches the shared-key handling — it has a `.claude` directory, so the no-ancestor
+early exit does not catch it — and the prune-before-branch ordering clears the
+stale entry as a side effect, even though that project was never a reference. So
+the remedy is not "find the deleted project," which is impossible; it is any
+`chain` or `unchain` anywhere on the machine, which `status` names.
 
 This ordering-independence is the whole point. An earlier draft of D17 kept the
 key in `writes`, one entry per project, and had the last remaining entry restore
