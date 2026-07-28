@@ -63,17 +63,6 @@ object, and exit-code signalling must not be mixed with JSON output.
 **Therefore the alert the previous design emitted was never visible to the user.**
 That, not missing automation, was the bug in it.
 
-### Fact 4 — process env beats settings.json for `ROLLING_CONTEXT_UPSTREAM`
-
-Probe: `tests/spikes/precedence_probe.py`. Two local listeners, A and B; the process
-environment named A, a fake `HOME`'s `~/.claude/settings.json` named B. One request
-through the proxy: A received it (`env_listener_A: 1`), B did not
-(`settings_listener_B: 0`). Repeated once, same result.
-
-**Therefore §7's tier order — process environment before `settings.json` — is
-correct as assumed, and the `upstream-pinned-by-env` guard (§6) rests on a
-measured fact, not an assertion.**
-
 ### Fact 3 — scope precedence
 
 Measured in spike `Gemini-b9b.1`:
@@ -89,6 +78,17 @@ effect. A foreign proxy that only sets child
 environment therefore cannot displace our user-scope value. Displacement can only
 originate in a settings *file* — which is the file we must write, at the scope we
 found it. Where to write is not a free choice.
+
+### Fact 4 — process env beats settings.json for `ROLLING_CONTEXT_UPSTREAM`
+
+Probe: `tests/spikes/precedence_probe.py`. Two local listeners, A and B; the process
+environment named A, a fake `HOME`'s `~/.claude/settings.json` named B. One request
+through the proxy: A received it (`env_listener_A: 1`), B did not
+(`settings_listener_B: 0`). Repeated once, same result.
+
+**Therefore §7's tier order — process environment before `settings.json` — is
+correct as assumed, and the `upstream-pinned-by-env` guard (§6) rests on a
+measured fact, not an assertion.**
 
 ## 3. Decisions
 
