@@ -10,7 +10,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _sources():
-    for rel in ("proxy/chain.py", "hooks/start-proxy.sh"):
+    for rel in ("proxy/chain.py", "hooks/start-proxy.sh", "install.sh"):
         with open(os.path.join(REPO, rel), encoding="utf-8") as f:
             yield rel, f.read()
 

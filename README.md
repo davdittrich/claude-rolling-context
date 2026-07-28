@@ -272,7 +272,10 @@ target drifts underneath you.
   just through Rolling Context first. It refuses, printing why and writing nothing, when: the
   value is exported in your shell environment (settings can't safely override that); the target
   isn't a loopback address (Rolling Context only chains to local proxies — never forwards your API
-  key off-machine); the value is set by managed-settings.json (an administrator policy); or
+  key off-machine); the value is set by managed-settings.json (an administrator policy);
+  `ROLLING_CONTEXT_UPSTREAM` is already set to something Rolling Context did not write
+  (remove it yourself first); the target uses Rolling Context's own port on a different
+  host (that reads as a misconfiguration, not a proxy worth chaining to); or
   you're already chained somewhere else (run `/rolling-context:unchain` first).
 - **`/rolling-context:unchain`** gives back exactly what `chain` displaced, byte-for-byte, for the
   current project.
@@ -300,7 +303,7 @@ Returns compression stats and runtime info. Fields include:
 - `recent_requests` — the last 3 routed requests, newest first. Each entry: `ts` (ISO 8601 local datetime string, e.g. `2026-07-25T16:30:00+02:00`), `before_chars` (context received from Claude Code), `after_chars` (context forwarded upstream after any compressed-prefix injection; equals `before_chars` when nothing was injected), `injected` (bool), `after_tokens` (real upstream-reported input tokens for the forwarded request; `0` when upstream reported none — never an estimate).
 - `last_compression` — the most recent compression event, or `null` before any has run. Keys: `ts` (ISO 8601 local datetime string, e.g. `2026-07-25T16:30:00+02:00`), `before_chars` and `after_chars` (exact context size in vs out of the compression), `before_tokens` (real token count that triggered it; `0` if unknown). No after-token count — compression output tokens are only estimable.
 - config echo: `trigger_tokens`, `target_tokens`, `keep_turns`, `keep_floor`, `summarizer_model`, `summarizer_mode`, `upstream_url`.
-- `upstream_source` — where `upstream_url` came from: the settings-file path that set it (managed/project-local/project-shared/user), or `<environment>` if only your shell exported it.
+- `upstream_source` — where `upstream_url` came from: the path of your user settings file when that set it, `<environment>` when your shell exported it, or `(default)` when nothing set it and requests go straight to the API.
 - `chained` — `true` unless the resolved upstream is the default `api.anthropic.com` (i.e. Rolling Context is forwarding through another proxy).
 - `upstream_reachable` — `true` if a fast TCP probe to the upstream host:port succeeded.
 
