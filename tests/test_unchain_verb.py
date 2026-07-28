@@ -2,10 +2,12 @@
 
 Run: python3 -m unittest discover -s tests
 """
+import io
 import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from unittest import mock
 
 from proxy import chain
@@ -93,6 +95,17 @@ class UnchainTest(unittest.TestCase):
 
     def test_no_project_ancestor_is_an_exit_zero_report(self):
         self.assertEqual(chain.do_unchain(self.home), 0)
+
+    def test_no_record_says_so_plainly_not_unchained(self):
+        # D2/M5: a no-op unchain (nothing recorded for this project) must not print
+        # "unchained" -- that's indistinguishable from a real restore.
+        a = self._project("a")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = chain.do_unchain(a)
+        self.assertEqual(code, 0)
+        self.assertIn("nothing recorded", buf.getvalue())
+        self.assertNotIn("unchained", buf.getvalue())
 
     def test_a_project_reached_by_symlink_still_unchains(self):
         # do_chain keys its state record with os.path.realpath(project); do_unchain

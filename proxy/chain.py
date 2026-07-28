@@ -349,10 +349,20 @@ def do_chain(project, assume_yes=False):
             return 2
 
         ours = f"http://127.0.0.1:{our_bind()[1]}"
+        # The environment is the weakest scope (Fact 3) and not a real settings file -- write
+        # into the project-local file that outranks it instead. There is no file value to give
+        # back, so record displaced=None; unchain's existing None-restores-by-deleting path
+        # then removes the key instead of restoring a bogus value.
+        write_target, displaced = source, url
+        if source == "<environment>":
+            write_target = os.path.join(project, ".claude", "settings.local.json")
+            displaced = None
+
         # Keyed by project: D10 allows two chained at once, and an unkeyed record would let
         # B's chain overwrite A's, after which A's unchain would restore B's displaced value
         # into B's file -- un-chaining a project the user never named.
-        state.setdefault("abu", {})[os.path.realpath(project)] = {"path": source, "wrote": ours, "displaced": url}
+        state.setdefault("abu", {})[os.path.realpath(project)] = {
+            "path": write_target, "wrote": ours, "displaced": displaced}
         state["upstream"] = {"wrote": url}
         save_state(state)
 
@@ -360,7 +370,7 @@ def do_chain(project, assume_yes=False):
         # forward, and "no upstream recorded" resolves to the default API -- silently
         # un-chaining the user, which D9 forbids.
         _write_key(user_settings_path(), USER_KEY, url)
-        _write_key(source, ABU_KEY, ours)
+        _write_key(write_target, ABU_KEY, ours)
 
         # Read back the EFFECTIVE value, not the file we just wrote. A managed policy -- which
         # may arrive by plist, registry or drop-in, where no file check can see it -- leaves our
@@ -368,7 +378,7 @@ def do_chain(project, assume_yes=False):
         # the only channel-agnostic way to know the write won.
         landed, landed_source = effective(ABU_KEY, project)
         if _read_key(user_settings_path(), USER_KEY) != url or not is_self(landed or ""):
-            _write_key(source, ABU_KEY, url)
+            _write_key(write_target, ABU_KEY, displaced)
             _write_key(user_settings_path(), USER_KEY, None)
             save_state(empty_state())
             if landed and not is_self(landed):
@@ -396,6 +406,7 @@ def do_unchain(project, all_=False):
         # Give back the key someone else owns -- this project's record and no other.
         records = state.get("abu") or {}
         targets = list(records) if all_ else ([root] if root in records else [])
+        did_anything = False
         for key in targets:
             abu = records[key]
             if _read_key(abu["path"], ABU_KEY) == abu["wrote"]:
@@ -403,6 +414,7 @@ def do_unchain(project, all_=False):
             else:
                 print(f"skipped {display(abu['path'])} — {ABU_KEY} is no longer ours")
             del records[key]
+            did_anything = True
         state["abu"] = records
 
         # Our own key is left set. Restoring ANTHROPIC_BASE_URL above already took this
@@ -416,8 +428,11 @@ def do_unchain(project, all_=False):
             else:
                 print(f"skipped {USER_KEY} — it is no longer ours")
             state["upstream"] = None
+            did_anything = True
         save_state(state)
-        print("unchained")
+        # D2/M5: an empty run is a legitimate no-op, but printing "unchained" for it is
+        # indistinguishable from a real restore -- say plainly that nothing happened.
+        print("unchained" if did_anything else "nothing recorded for this project — nothing to undo")
         return 0
     except UnparseableSettings as e:
         print(f"not unchained — {display(e.path)} is not valid JSON — refusing to touch it")

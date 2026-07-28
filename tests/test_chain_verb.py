@@ -179,6 +179,38 @@ class ChainVerbTest(unittest.TestCase):
         self.assertEqual(open(self.local, "rb").read(), before_local)
         self.assertFalse(os.path.exists(state_path))
 
+    def test_chains_when_the_displacement_is_env_only(self):
+        # D1: ANTHROPIC_BASE_URL set only in the process environment, no settings-file
+        # entry anywhere -- effective() returns source="<environment>", a sentinel, not
+        # a path. do_chain must write into the project's own file instead of handing
+        # that sentinel to _write_key.
+        with mock.patch.dict(os.environ, {"ANTHROPIC_BASE_URL": FOREIGN}):
+            self.assertEqual(chain.do_chain(self.project, assume_yes=True), 0)
+        self.assertTrue(chain.is_self(self._local_env()["ANTHROPIC_BASE_URL"]))
+        record = chain.load_state()["abu"][self.project]
+        self.assertEqual(record["path"], self.local)
+        self.assertIsNone(record["displaced"])
+
+    def test_unchain_after_env_only_chain_deletes_rather_than_restores(self):
+        with mock.patch.dict(os.environ, {"ANTHROPIC_BASE_URL": FOREIGN}):
+            self.assertEqual(chain.do_chain(self.project, assume_yes=True), 0)
+        self.assertEqual(chain.do_unchain(self.project), 0)
+        self.assertNotIn("ANTHROPIC_BASE_URL", self._local_env())
+
+    def test_the_environment_sentinel_never_reaches_write_key(self):
+        calls = []
+        real_write_key = chain._write_key
+
+        def recording(path, key, value):
+            calls.append(path)
+            return real_write_key(path, key, value)
+
+        with mock.patch.dict(os.environ, {"ANTHROPIC_BASE_URL": FOREIGN}), \
+                mock.patch.object(chain, "_write_key", side_effect=recording):
+            self.assertEqual(chain.do_chain(self.project, assume_yes=True), 0)
+        self.assertTrue(calls, "expected _write_key to be called")
+        self.assertFalse(any("<environment>" in p for p in calls))
+
     def test_unknown_chain_flag_is_rejected_not_silently_ignored(self):
         self.assertEqual(chain.main(["chain", "--yse"]), 1)
 
