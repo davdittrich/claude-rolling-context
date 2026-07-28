@@ -191,7 +191,22 @@ def current_upstream() -> Upstream:
         from_file = False
 
     raw = raw or "https://api.anthropic.com"
-    parsed = urlparse(raw)
+
+    if from_env:
+        source = "<environment>"
+    elif from_file:
+        source = chain.user_settings_path()
+    else:
+        source = "(default)"
+
+    # One typed failure out of this function. Callers already handle
+    # UpstreamRefused; a bare ValueError escaping here killed the daemon at
+    # startup and turned /health into a traceback.
+    try:
+        parsed = urlparse(raw)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise UpstreamRefused(raw, source, "malformed") from exc
 
     # D18: a file-sourced upstream must be loopback, or a compromised or
     # careless writer of settings.json could redirect every request -- and
@@ -201,17 +216,10 @@ def current_upstream() -> Upstream:
     if from_file and not chain.host_matches(parsed.hostname, "127.0.0.1"):
         raise UpstreamRefused(raw, chain.user_settings_path(), "not-loopback")
 
-    if from_env:
-        source = "<environment>"
-    elif from_file:
-        source = chain.user_settings_path()
-    else:
-        source = "(default)"
-
     value = Upstream(
         parsed.scheme,
         parsed.hostname,
-        parsed.port or (443 if parsed.scheme == "https" else 80),
+        port,
         parsed.path or "",
         source,
     )
@@ -260,6 +268,11 @@ def _upstream_error_body(exc: Exception) -> bytes:
                 f"rolling-context: refusing to use {exc.url} as upstream — it points back at "
                 f"this proxy itself, which would forward every request in an infinite loop. "
                 f"Fix ROLLING_CONTEXT_UPSTREAM in your shell.")
+        if exc.reason == "malformed":
+            return _api_error(
+                f"rolling-context: refusing to use chained upstream {exc.url} from {exc.path} — "
+                f"the value could not be parsed as a URL. "
+                f"Fix or remove the value.")
         return _api_error(
             f"rolling-context: refusing to use chained upstream {exc.url} from {exc.path} — "
             f"it is not a loopback address, so forwarding would send your API key off-machine. "
