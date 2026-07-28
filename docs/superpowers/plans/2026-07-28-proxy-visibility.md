@@ -481,7 +481,15 @@ def user_settings_path():
 
 
 def managed_settings_path():
-    """Administrator policy. Highest precedence of all, and unwinnable by a write."""
+    """Administrator policy file. Highest precedence, and unwinnable by a write.
+
+    Paths per the Claude Code settings docs. This covers the file delivery channel only --
+    managed settings can also arrive by macOS plist, Windows registry (HKLM/HKCU), or
+    managed-settings.d/ drop-ins, none of which a stdlib file read can see. The guard below
+    is therefore a courtesy that produces a precise message when it fires; the guarantee that
+    we never leave a write in place that cannot win comes from chain's effective-value
+    read-back, which is channel-agnostic.
+    """
     if sys.platform == "darwin":
         return "/Library/Application Support/ClaudeCode/managed-settings.json"
     if os.name == "nt":
@@ -933,6 +941,24 @@ class ChainVerbTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"ROLLING_CONTEXT_UPSTREAM": FOREIGN}):
             self.assertEqual(chain.do_chain(self.project, assume_yes=True), 0)
 
+    def test_a_higher_scope_that_outranks_our_write_undoes_it(self):
+        # A managed policy can arrive by a channel no file check sees. The effective-value
+        # read-back is what catches it, so this asserts the undo, not the detection.
+        self._displace()
+        higher = os.path.join(self.project, ".claude", "settings.local.json")
+        real_effective = chain.effective
+
+        def outranked(key, root):
+            if key == chain.ABU_KEY:
+                return FOREIGN, "/etc/claude-code/managed-settings.json"
+            return real_effective(key, root)
+
+        with mock.patch.object(chain, "effective", side_effect=outranked):
+            self.assertEqual(chain.do_chain(self.project, assume_yes=True), 1)
+        self.assertEqual(chain.load_state(), chain.empty_state())
+        with open(higher, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["env"]["ANTHROPIC_BASE_URL"], FOREIGN)
+
     def test_unparseable_settings_refuses_and_leaves_the_file(self):
         with open(self.local, "w", encoding="utf-8") as f:
             f.write("{ broken")
@@ -1251,12 +1277,20 @@ def do_chain(project, assume_yes=False):
         _write_key(user_settings_path(), USER_KEY, url)
         _write_key(source, ABU_KEY, ours)
 
-        if _read_key(user_settings_path(), USER_KEY) != url or \
-           _read_key(source, ABU_KEY) != ours:
+        # Read back the EFFECTIVE value, not the file we just wrote. A managed policy -- which
+        # may arrive by plist, registry or drop-in, where no file check can see it -- leaves our
+        # write in place while the value that actually applies stays foreign. Resolving again is
+        # the only channel-agnostic way to know the write won.
+        landed, landed_source = effective(ABU_KEY, project)
+        if _read_key(user_settings_path(), USER_KEY) != url or not is_self(landed or ""):
             _write_key(source, ABU_KEY, url)
             _write_key(user_settings_path(), USER_KEY, None)
             save_state(empty_state())
-            print("not chained — read-back failed, changes undone")
+            if landed and not is_self(landed):
+                print(f"not chained — {display(landed_source)} still supplies "
+                      f"{display(landed)}, which outranks what we wrote. changes undone")
+            else:
+                print("not chained — read-back failed, changes undone")
             return 1
         print(f"chained: {display(url)} is now upstream; rolling-context is back in the path")
         return 0
@@ -1373,7 +1407,7 @@ def main(argv):
 - [ ] **Step 4: Run and verify they pass**
 
   Run: `python3 -m unittest tests.test_chain_verb tests.test_unchain_verb tests.test_status_verb -v`
-  Expected: PASS, 23 tests.
+  Expected: PASS, 24 tests.
 
 - [ ] **Step 4b: Create the entry point every message names**
 
