@@ -63,6 +63,17 @@ object, and exit-code signalling must not be mixed with JSON output.
 **Therefore the alert the previous design emitted was never visible to the user.**
 That, not missing automation, was the bug in it.
 
+### Fact 4 — process env beats settings.json for `ROLLING_CONTEXT_UPSTREAM`
+
+Probe: `tests/spikes/precedence_probe.py`. Two local listeners, A and B; the process
+environment named A, a fake `HOME`'s `~/.claude/settings.json` named B. One request
+through the proxy: A received it (`env_listener_A: 1`), B did not
+(`settings_listener_B: 0`). Repeated once, same result.
+
+**Therefore §7's tier order — process environment before `settings.json` — is
+correct as assumed, and the `upstream-pinned-by-env` guard (§6) rests on a
+measured fact, not an assertion.**
+
 ### Fact 3 — scope precedence
 
 Measured in spike `Gemini-b9b.1`:
@@ -735,22 +746,8 @@ Tests importing `_fakes` run via `python3 -m unittest discover -s tests`.
 
 ## 12. Open items
 
-One, to be resolved by probe during implementation rather than assumed:
-
-**Tier-1-over-tier-2 precedence is asserted, not measured.** §7 states that
-`ROLLING_CONTEXT_UPSTREAM` from the process environment beats the value in
-`~/.claude/settings.json`. That is how our own resolver will be written, so within
-our code it is true by construction — but the claim that matters is the one about
-*Claude Code's* behaviour when both are present, and no probe in §2 measured it.
-Fact 3 measured project-`settings.local.json` versus inherited process env for
-`ANTHROPIC_BASE_URL`, which is a different pair of sources and a different key.
-This probe is the **first** implementation task, not a later one: the
-`upstream-pinned-by-env` guard (§6), its refusal message, and the tier order all
-depend on the outcome. Before implementing that guard, run a probe in the
-style of the Fact 1/Fact 3 spikes — set both, observe which one a live session
-actually uses — and record the result here as a measured fact. If the measurement
-contradicts the assumption, the guard's refusal message and the tier order both
-change.
+Tier-1-over-tier-2 precedence was asserted, not measured, when this spec was
+written. It is now measured: see Fact 4 in §2.
 
 ### Review provenance
 
