@@ -23,6 +23,7 @@ Two summarization modes:
 Pure stdlib — no external dependencies.
 """
 
+import collections
 import copy
 import gzip
 import json
@@ -35,9 +36,7 @@ from urllib.parse import urlparse
 
 log = logging.getLogger("rolling-context.compressor")
 
-_default_summarizer_url = os.environ.get("ROLLING_CONTEXT_UPSTREAM") or "https://api.anthropic.com"
 SUMMARIZER_URL_SET = bool(os.environ.get("ROLLING_CONTEXT_SUMMARIZER_URL"))
-SUMMARIZER_BASE_URL = os.environ.get("ROLLING_CONTEXT_SUMMARIZER_URL") or _default_summarizer_url
 SUMMARIZER_API_KEY = os.environ.get("ROLLING_CONTEXT_SUMMARIZER_KEY") or ""
 # "anthropic" (default) or "openai" — openai speaks /v1/chat/completions
 SUMMARIZER_FORMAT = (os.environ.get("ROLLING_CONTEXT_SUMMARIZER_FORMAT") or "anthropic").lower()
@@ -53,28 +52,35 @@ LEGACY_DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 
 ssl_ctx = ssl.create_default_context()
 
-_parsed_summarizer = urlparse(SUMMARIZER_BASE_URL)
-_SUMMARIZER_HOST = _parsed_summarizer.hostname
-_SUMMARIZER_PORT = _parsed_summarizer.port
-_SUMMARIZER_SCHEME = _parsed_summarizer.scheme
-_SUMMARIZER_PATH = _parsed_summarizer.path or ""
+SummarizerEndpoint = collections.namedtuple("SummarizerEndpoint", "scheme host port path")
 
 
-def _summarizer_conn(timeout=600):
+def summarizer_endpoint() -> "SummarizerEndpoint":
+    """The summarizer's live endpoint (spec section 7): follows server's
+    per-request current_upstream() unless ROLLING_CONTEXT_SUMMARIZER_URL is
+    set, in which case that explicit override stays authoritative. A frozen
+    summarizer URL would send compaction traffic to the old upstream while
+    chat requests follow the new one -- half-working, which is the class of
+    failure this whole design exists to end."""
+    override = os.environ.get("ROLLING_CONTEXT_SUMMARIZER_URL")
+    if override:
+        parsed = urlparse(override)
+        return SummarizerEndpoint(
+            parsed.scheme,
+            parsed.hostname,
+            parsed.port or (443 if parsed.scheme == "https" else 80),
+            parsed.path or "",
+        )
+    import server  # lazy: server.py imports from compressor at module load
+    return server.current_upstream()
+
+
+def _summarizer_conn(ep: "SummarizerEndpoint", timeout=600):
     """Create a connection to the summarizer server (same style as server.py)."""
-    if _SUMMARIZER_SCHEME == "https":
-        return http.client.HTTPSConnection(
-            _SUMMARIZER_HOST,
-            _SUMMARIZER_PORT or 443,
-            context=ssl_ctx,
-            timeout=timeout,
-        )
+    if ep.scheme == "https":
+        return http.client.HTTPSConnection(ep.host, ep.port or 443, context=ssl_ctx, timeout=timeout)
     else:
-        return http.client.HTTPConnection(
-            _SUMMARIZER_HOST,
-            _SUMMARIZER_PORT or 80,
-            timeout=timeout,
-        )
+        return http.client.HTTPConnection(ep.host, ep.port or 80, timeout=timeout)
 
 
 def _join_path(upstream_path: str, request_path: str) -> str:
@@ -442,9 +448,10 @@ class RollingCompressor:
         headers = _clean_headers(auth_headers)
         headers["content-length"] = str(len(req_body))
         headers["accept-encoding"] = "identity"
-        summarizer_path = _join_path(_SUMMARIZER_PATH, "/v1/messages")
+        ep = summarizer_endpoint()
+        summarizer_path = _join_path(ep.path, "/v1/messages")
         log.info(f"Summary over budget -> condense pass ({len(summary_text):,} chars)")
-        conn = _summarizer_conn()
+        conn = _summarizer_conn(ep)
         conn.request("POST", summarizer_path, body=req_body, headers=headers)
         resp = conn.getresponse()
         resp_body = resp.read()
@@ -529,13 +536,14 @@ class RollingCompressor:
         headers["content-length"] = str(len(req_body))
         headers["accept-encoding"] = "identity"
 
-        summarizer_path = _join_path(_SUMMARIZER_PATH, "/v1/messages")
+        ep = summarizer_endpoint()
+        summarizer_path = _join_path(ep.path, "/v1/messages")
         log.info(
-            f"Native compaction request -> {SUMMARIZER_BASE_URL} "
+            f"Native compaction request -> {ep.scheme}://{ep.host}:{ep.port} "
             f"model={model} messages={len(body['messages'])} ({len(req_body):,} bytes)"
         )
 
-        conn = _summarizer_conn()
+        conn = _summarizer_conn(ep)
         conn.request("POST", summarizer_path, body=req_body, headers=headers)
         resp = conn.getresponse()
         resp_body = resp.read()
@@ -573,6 +581,7 @@ class RollingCompressor:
         "max_tokens"). No guard/retry here — the caller applies the guard."""
         summary_max_tokens = 20000
         model = self.summarizer_model or LEGACY_DEFAULT_MODEL
+        ep = summarizer_endpoint()
 
         if SUMMARIZER_FORMAT == "openai":
             if not self.summarizer_model:
@@ -580,7 +589,7 @@ class RollingCompressor:
                     "ROLLING_CONTEXT_SUMMARIZER_FORMAT=openai requires "
                     "ROLLING_CONTEXT_MODEL to name the summarizer model"
                 )
-            path = _join_path(_SUMMARIZER_PATH, "/v1/chat/completions")
+            path = _join_path(ep.path, "/v1/chat/completions")
             req_body = json.dumps({
                 "model": model,
                 "max_tokens": summary_max_tokens,
@@ -590,7 +599,7 @@ class RollingCompressor:
             if SUMMARIZER_API_KEY:
                 headers["authorization"] = f"Bearer {SUMMARIZER_API_KEY}"
         else:
-            path = _join_path(_SUMMARIZER_PATH, "/v1/messages")
+            path = _join_path(ep.path, "/v1/messages")
             req_body = json.dumps({
                 "model": model,
                 "max_tokens": summary_max_tokens,
@@ -608,11 +617,11 @@ class RollingCompressor:
         headers["accept-encoding"] = "identity"
 
         log.info(
-            f"Compression request -> {SUMMARIZER_BASE_URL} path={path} "
+            f"Compression request -> {ep.scheme}://{ep.host}:{ep.port} path={path} "
             f"format={SUMMARIZER_FORMAT} model={model}"
         )
 
-        conn = _summarizer_conn(timeout=120)
+        conn = _summarizer_conn(ep, timeout=120)
         conn.request("POST", path, body=req_body, headers=headers)
         resp = conn.getresponse()
         resp_body = resp.read()

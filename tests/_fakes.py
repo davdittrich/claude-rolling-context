@@ -20,7 +20,11 @@ import io
 import json
 import os
 import sys
+import tempfile
+import threading
 from email.message import Message
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "proxy"))
 from server import ProxyHandler  # noqa: E402
@@ -135,7 +139,53 @@ def seed_evictable(store):
     return entry
 
 
-def make_handler(body: bytes) -> ProxyHandler:
+def hermetic_home(testcase):
+    """Point HOME at a fresh tempdir and strip the upstream-resolution env
+    vars this machine exports, so tests see only what they write themselves.
+    Shared by the tests/test_*upstream*.py and tests/test_loop_protection.py
+    family -- see tests/test_chain_verb.py for the pattern this mirrors."""
+    home = tempfile.mkdtemp(prefix="rolling-context-home-")
+    os.makedirs(os.path.join(home, ".claude"), exist_ok=True)
+    patch = mock.patch.dict(os.environ, {"HOME": home}, clear=False)
+    patch.start()
+    os.environ.pop("ANTHROPIC_BASE_URL", None)
+    os.environ.pop("ROLLING_CONTEXT_UPSTREAM", None)
+    os.environ.pop("ROLLING_CONTEXT_PORT", None)
+    testcase.addCleanup(patch.stop)
+    return home
+
+
+def write_user_settings(home, env):
+    path = os.path.join(home, ".claude", "settings.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"env": env}, f)
+
+
+def start_listener(port, hits=None):
+    """Spin up a real HTTPServer on 127.0.0.1:port; each POST appends `port`
+    to `hits` (if given) and replays a stub /v1/messages 200 response."""
+    log = hits if hits is not None else []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            log.append(port)
+            body = b'{"type":"message","role":"assistant","content":[]}'
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    httpd = HTTPServer(("127.0.0.1", port), Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    return httpd
+
+
+def make_handler(body: bytes, headers: dict | None = None) -> ProxyHandler:
     """Build a ProxyHandler without going through socketserver's __init__."""
     handler = ProxyHandler.__new__(ProxyHandler)
     handler.request_version = "HTTP/1.1"
@@ -144,9 +194,11 @@ def make_handler(body: bytes) -> ProxyHandler:
     handler.requestline = "POST /v1/messages HTTP/1.1"
     handler.client_address = ("127.0.0.1", 0)
 
-    headers = Message()
-    headers["content-length"] = str(len(body))
-    handler.headers = headers
+    msg_headers = Message()
+    msg_headers["content-length"] = str(len(body))
+    for key, value in (headers or {}).items():
+        msg_headers[key] = value
+    handler.headers = msg_headers
     handler.rfile = io.BytesIO(body)
     handler.wfile = io.BytesIO()
     return handler

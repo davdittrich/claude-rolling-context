@@ -72,7 +72,7 @@ class _FlattenedGuardBase(unittest.TestCase):
 
     def _seq(self, replies):
         conn = _SeqConn(replies)
-        compressor._summarizer_conn = lambda timeout=120: conn
+        compressor._summarizer_conn = lambda ep, timeout=120: conn
         return conn
 
     def _call(self):

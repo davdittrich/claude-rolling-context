@@ -46,7 +46,7 @@ def _health_json():
 class LastCompressionTest(unittest.TestCase):
     def setUp(self):
         self._real = compressor._summarizer_conn
-        compressor._summarizer_conn = lambda timeout=600: FakeSummarizerConn(
+        compressor._summarizer_conn = lambda ep, timeout=600: FakeSummarizerConn(
             reply_text="mocked deterministic summary text.")
 
     def tearDown(self):

@@ -74,7 +74,7 @@ class NativeCarryForwardStructuralTest(unittest.TestCase):
         self._fake_conn = FakeSummarizerConn(
             reply_text="NEW mocked summary of the appended events.", capture=True
         )
-        compressor._summarizer_conn = lambda timeout=600: self._fake_conn
+        compressor._summarizer_conn = lambda ep, timeout=600: self._fake_conn
 
     def tearDown(self):
         compressor._summarizer_conn = self._real_conn_fn

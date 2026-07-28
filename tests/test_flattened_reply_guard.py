@@ -82,7 +82,7 @@ class _FlattenedReplyGuardTestBase(unittest.TestCase):
         importlib.reload(compressor)
 
     def _fake_reply(self, reply_obj):
-        compressor._summarizer_conn = lambda timeout=120: _FakeConn(reply_obj)
+        compressor._summarizer_conn = lambda ep, timeout=120: _FakeConn(reply_obj)
 
     def _call(self):
         return self.comp._summarize_flattened(prompt="summarize this", auth_headers={})

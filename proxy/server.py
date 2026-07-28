@@ -23,10 +23,12 @@ import logging
 import threading
 import time
 import ssl
+import socket
 import http.client
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
+import chain
 from compressor import RollingCompressor, SUMMARY_MARKER, NATIVE_MODE, SUMMARIZER_FORMAT, SUMMARIZER_MODEL
 
 class FlushFileHandler(logging.FileHandler):
@@ -68,36 +70,6 @@ def _load_version() -> str:
 PROXY_VERSION = _load_version()
 
 
-def _load_upstream() -> str:
-    """Resolve the upstream API endpoint.
-
-    Prefer ROLLING_CONTEXT_UPSTREAM from the environment. The hook writes it into
-    settings.json but does not export it into this process (issue #3), so fall
-    back to reading settings.json directly — this is what lets the proxy work
-    with custom endpoints (DeepSeek, OpenRouter, a local proxy, a chained PII
-    proxy) instead of always hitting api.anthropic.com.
-    """
-    up = os.environ.get("ROLLING_CONTEXT_UPSTREAM")
-    if up:
-        return up
-    try:
-        settings_path = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
-        with open(settings_path, encoding="utf-8") as f:
-            env_vars = (json.load(f) or {}).get("env", {}) or {}
-        up = env_vars.get("ROLLING_CONTEXT_UPSTREAM")
-        if up:
-            return up
-        # Last resort: a custom ANTHROPIC_BASE_URL — but never route back at
-        # ourselves (that would loop).
-        base = env_vars.get("ANTHROPIC_BASE_URL", "")
-        if base and (urlparse(base).port or 0) != LISTEN_PORT:
-            return base
-    except Exception as e:
-        log.warning(f"[UPSTREAM] Failed to read {settings_path}: {e} — falling back to api.anthropic.com")
-    return "https://api.anthropic.com"
-
-
-UPSTREAM_URL = _load_upstream()
 TRIGGER_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TRIGGER") or "100000")
 TARGET_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TARGET") or "40000")
 # Blend keep policy: keep between KEEP_FLOOR and KEEP_TURNS recent user-turns
@@ -120,8 +92,6 @@ DEBUG_MESSAGES_ENABLED = (os.environ.get("ROLLING_CONTEXT_DEBUG_MESSAGES") or ""
 DEBUG_MESSAGES_CAP = 50
 
 ssl_ctx = ssl.create_default_context()
-_parsed_upstream = urlparse(UPSTREAM_URL)
-UPSTREAM_PATH = _parsed_upstream.path or ""
 
 
 def _join_path(upstream_path: str, request_path: str) -> str:
@@ -146,21 +116,156 @@ compressor = RollingCompressor(
 )
 
 
-def _upstream_conn():
+Upstream = collections.namedtuple("Upstream", ["scheme", "host", "port", "path"])
+
+
+class UpstreamRefused(Exception):
+    """A chained upstream this daemon refuses to use: it either points back at
+    ourselves (an infinite forwarding loop) or, for a file-sourced value
+    (D18), is not a loopback address -- which would forward the API key
+    off-machine to whatever wrote that file."""
+
+    def __init__(self, url, path, reason):
+        super().__init__(f"refusing to use chained upstream {url} from {path} ({reason})")
+        self.url = url
+        self.path = path
+        self.reason = reason
+
+
+_UPSTREAM_CACHE = {"stamp": None, "value": None}
+
+
+def _settings_stamp():
+    try:
+        st = os.stat(chain.user_settings_path())
+        return st.st_mtime_ns, st.st_size
+    except FileNotFoundError:
+        return None
+
+
+def current_upstream() -> Upstream:
+    """Resolve the upstream per request, cached on the settings file's mtime
+    and size so a hot request path doesn't re-stat and re-parse JSON every
+    call.
+
+    Returns a parsed struct, not a string: a string-returning accessor only
+    fixes the literal UPSTREAM_URL sites and leaves the connection factory
+    building sockets from a frozen host/port -- that is the bug, not a
+    symptom.
+
+    Precedence (Fact 4, measured): the process environment beats settings
+    files for ROLLING_CONTEXT_UPSTREAM -- the opposite of ANTHROPIC_BASE_URL's
+    Fact 3 (chain.effective()), where files win. A file-sourced value must
+    resolve to a loopback address (D18); an exported env var is the user
+    acting deliberately in their own shell and is exempt from that check, but
+    not from the self-loop check below -- pointing back at ourselves would
+    forward every request to this same handler forever.
+    """
+    stamp = _settings_stamp()
+    if _UPSTREAM_CACHE["value"] is not None and _UPSTREAM_CACHE["stamp"] == stamp:
+        return _UPSTREAM_CACHE["value"]
+
+    raw = os.environ.get("ROLLING_CONTEXT_UPSTREAM")
+    from_env = bool(raw)
+    if from_env and chain.is_self(raw):
+        raise UpstreamRefused(raw, "<environment>", "loop")
+
+    from_file = False
+    if not raw:
+        env = chain.read_settings(chain.user_settings_path()).get("env") or {}
+        raw = env.get("ROLLING_CONTEXT_UPSTREAM")
+        if raw:
+            from_file = True
+        else:
+            candidate = env.get("ANTHROPIC_BASE_URL")
+            if candidate and not chain.is_self(candidate):
+                raw = candidate
+                from_file = True
+
+    if from_file and chain.is_self(raw):
+        # Machine-written self-pointer: settings.json self-corrects on the
+        # next chain/unchain, so treat this as "nothing configured" rather
+        # than raising -- unlike a deliberate env export, this isn't a
+        # decision anyone actually made.
+        raw = None
+        from_file = False
+
+    raw = raw or "https://api.anthropic.com"
+    parsed = urlparse(raw)
+
+    # D18: a file-sourced upstream must be loopback, or a compromised or
+    # careless writer of settings.json could redirect every request -- and
+    # the API key with it -- off-machine. A malformed value parses to
+    # hostname=None, which must be refused here rather than falling through
+    # to a connection factory built from Upstream(host=None, ...).
+    if from_file and not chain.host_matches(parsed.hostname, "127.0.0.1"):
+        raise UpstreamRefused(raw, chain.user_settings_path(), "not-loopback")
+
+    value = Upstream(
+        parsed.scheme,
+        parsed.hostname,
+        parsed.port or (443 if parsed.scheme == "https" else 80),
+        parsed.path or "",
+    )
+    _UPSTREAM_CACHE.update(stamp=stamp, value=value)
+    return value
+
+
+def _upstream_conn(up: "Upstream"):
     """Create a connection to the upstream server."""
-    if _parsed_upstream.scheme == "https":
+    if up.scheme == "https":
         return http.client.HTTPSConnection(
-            _parsed_upstream.hostname,
-            _parsed_upstream.port or 443,
+            up.host,
+            up.port,
             context=ssl_ctx,
             timeout=600,
         )
     else:
         return http.client.HTTPConnection(
-            _parsed_upstream.hostname,
-            _parsed_upstream.port or 80,
+            up.host,
+            up.port,
             timeout=600,
         )
+
+
+def _upstream_reachable(up: "Upstream") -> bool:
+    # ponytail: 0.5s probe timeout tuned for loopback chains; loosen if a
+    # slow real-world WAN upstream makes /health flake.
+    try:
+        with socket.create_connection((up.host, up.port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _api_error(message: str) -> bytes:
+    return json.dumps({"type": "error", "error": {"type": "api_error", "message": message}}).encode()
+
+
+def _upstream_error_body(exc: Exception) -> bytes:
+    """D9: render upstream failures as a message Claude Code shows the user,
+    not a raw transport exception."""
+    resolved = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if isinstance(exc, UpstreamRefused):
+        if exc.reason == "loop":
+            return _api_error(
+                f"rolling-context: refusing to use {exc.url} as upstream — it points back at "
+                f"this proxy itself, which would forward every request in an infinite loop. "
+                f"Fix ROLLING_CONTEXT_UPSTREAM in your shell.")
+        return _api_error(
+            f"rolling-context: refusing to use chained upstream {exc.url} from {exc.path} — "
+            f"it is not a loopback address, so forwarding would send your API key off-machine. "
+            f"Fix or remove the value.")
+    up = _UPSTREAM_CACHE.get("value")
+    where = f"{up.scheme}://{up.host}:{up.port}" if up else "the chained upstream"
+    if os.environ.get("ROLLING_CONTEXT_UPSTREAM"):
+        return _api_error(
+            f"rolling-context: chained upstream {where} is not answering. It comes from "
+            f"ROLLING_CONTEXT_UPSTREAM in this session's environment, so unchain cannot clear it — "
+            f"unset ROLLING_CONTEXT_UPSTREAM in your shell and restart the proxy.")
+    return _api_error(
+        f"rolling-context: chained upstream {where} is not answering. "
+        f"Run: bash {resolved}/hooks/chain.sh unchain")
 
 
 # ---------------------------------------------------------------------------
@@ -443,8 +548,33 @@ def _forward_headers(req_headers: dict, body: bytes = None, strip_encoding: bool
         headers[key] = value
     if body is not None:
         headers["content-length"] = str(len(body))
+    our_host, our_port = chain.our_bind()
+    headers["X-Rolling-Context-Chained-From"] = f"http://{our_host}:{our_port}"
     log.debug(f"[HDR] Forwarding headers: {list(headers.keys())}")
     return headers
+
+
+def _loop_detected(req_headers: dict) -> bool:
+    """True when an inbound request already carries our own chained-from
+    marker (spec section 7): a cycle through an intermediate proxy, which
+    is_self alone (a direct self-chain check) would not catch. Uses the
+    same host_matches normalization is_self does -- a raw string compare
+    misses localhost against 127.0.0.1."""
+    marker = None
+    for key, value in req_headers.items():
+        if key.lower() == "x-rolling-context-chained-from":
+            marker = value
+            break
+    if not marker:
+        return False
+    try:
+        parsed = urlparse(marker)
+    except ValueError:
+        return False
+    if not parsed.hostname or not parsed.port:
+        return False
+    our_host, our_port = chain.our_bind()
+    return chain.host_matches(parsed.hostname, our_host) and parsed.port == our_port
 
 
 def get_passthrough_headers(req_headers: dict) -> dict:
@@ -625,13 +755,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _proxy_raw(self, method: str):
         """Raw proxy — forward request and stream response back."""
         body = self._read_body()
-        headers = _forward_headers(self._get_headers_dict(), body if body else None)
-
-        log.info(f"[RAW] {method} {self.path} -> {UPSTREAM_URL} (body={len(body)} bytes)")
+        req_headers = self._get_headers_dict()
+        if _loop_detected(req_headers):
+            error_body = _api_error(
+                "rolling-context: refusing to forward — this request already passed "
+                "through this proxy once (loop).")
+            self.send_response(200)  # D9: message body, not a transport-level error status
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(error_body)))
+            self.end_headers()
+            self.wfile.write(error_body)
+            return
+        headers = _forward_headers(req_headers, body if body else None)
 
         try:
-            conn = _upstream_conn()
-            upstream_full_path = _join_path(UPSTREAM_PATH, self.path)
+            up = current_upstream()
+            log.info(f"[RAW] {method} {self.path} -> {up.scheme}://{up.host}:{up.port} (body={len(body)} bytes)")
+            conn = _upstream_conn(up)
+            upstream_full_path = _join_path(up.path, self.path)
             conn.request(method, upstream_full_path, body=body if body else None, headers=headers)
             resp = conn.getresponse()
 
@@ -639,7 +780,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             self.send_response(resp.status)
             resp_headers = resp.getheaders()
-            log.debug(f"[RAW] Response headers: {resp_headers}")
+            log.debug(f"[RAW] Response header names: {[k for k, _ in resp_headers]}")
             has_content_length = False
             for key, value in resp_headers:
                 lower = key.lower()
@@ -665,8 +806,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             conn.close()
         except Exception as e:
             log.error(f"[RAW] Upstream error: {e}", exc_info=True)
-            error_body = json.dumps({"error": str(e)}).encode()
-            self.send_response(502)
+            error_body = _upstream_error_body(e)
+            self.send_response(200)  # D9: message body, not a transport-level error status
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(error_body)))
             self.end_headers()
@@ -755,6 +896,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
             1 for e in store.compressions
             if e["thread"] is not None and e["thread"].is_alive()
         )
+        try:
+            up = current_upstream()
+            upstream_url = f"{up.scheme}://{up.host}:{up.port}"
+            chained = up.host != "api.anthropic.com"
+            upstream_reachable = _upstream_reachable(up)
+        except UpstreamRefused as e:
+            upstream_url = f"(refused: {e.reason})"
+            chained = True
+            upstream_reachable = False
         data = {
             "status": "ok",
             "version": PROXY_VERSION,
@@ -764,7 +914,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "keep_floor": compressor.keep_floor,
             "summarizer_model": SUMMARIZER_MODEL or "(session model)",
             "summarizer_mode": "native" if NATIVE_MODE else f"flattened/{SUMMARIZER_FORMAT}",
-            "upstream_url": UPSTREAM_URL,
+            "upstream_url": upstream_url,
+            "chained": chained,
+            "upstream_reachable": upstream_reachable,
             "compression_count": compressor.compression_count,
             "total_tokens_saved": compressor.total_tokens_saved,
             "stored_compressions": len(store.compressions),
@@ -788,6 +940,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _handle_messages(self):
         raw_body = self._read_body()
         req_headers = self._get_headers_dict()
+        if _loop_detected(req_headers):
+            error_body = _api_error(
+                "rolling-context: refusing to forward — this request already passed "
+                "through this proxy once (loop).")
+            self.send_response(200)  # D9: message body, not a transport-level error status
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(error_body)))
+            self.end_headers()
+            self.wfile.write(error_body)
+            return
         auth_headers = get_passthrough_headers(req_headers)
 
         log.info(f"[MSG] POST {self.path} (body={len(raw_body)} bytes)")
@@ -862,11 +1024,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         body = json.dumps(payload).encode()
         headers = _forward_headers(req_headers, body, strip_encoding=True)
 
-        log.info(f"[MSG] Forwarding to {UPSTREAM_URL}{self.path} ({len(body):,} bytes)")
-
         try:
-            conn = _upstream_conn()
-            upstream_full_path = _join_path(UPSTREAM_PATH, self.path)
+            up = current_upstream()
+            log.info(f"[MSG] Forwarding to {up.scheme}://{up.host}:{up.port}{self.path} ({len(body):,} bytes)")
+            conn = _upstream_conn(up)
+            upstream_full_path = _join_path(up.path, self.path)
             conn.request("POST", upstream_full_path, body=body, headers=headers)
             resp = conn.getresponse()
 
@@ -874,7 +1036,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             self.send_response(resp.status)
             resp_headers = resp.getheaders()
-            log.debug(f"[MSG] Response headers: {resp_headers}")
+            log.debug(f"[MSG] Response header names: {[k for k, _ in resp_headers]}")
             has_content_length = False
             for key, value in resp_headers:
                 lower = key.lower()
@@ -1030,8 +1192,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         except Exception as e:
             log.error(f"[MSG] Upstream error: {e}", exc_info=True)
-            error_body = json.dumps({"error": str(e)}).encode()
-            self.send_response(502)
+            error_body = _upstream_error_body(e)
+            self.send_response(200)  # D9: message body, not a transport-level error status
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(error_body)))
             self.end_headers()
@@ -1062,7 +1224,11 @@ def main():
     log.info(f"  Summarizer model: {SUMMARIZER_MODEL or '(session model)'}")
     log.info(f"  Summarizer mode: "
              f"{'native (cloned session request, prompt-cached)' if NATIVE_MODE else f'flattened/{SUMMARIZER_FORMAT}'}")
-    log.info(f"  Forwarding to: {UPSTREAM_URL}")
+    try:
+        _startup_upstream = current_upstream()
+        log.info(f"  Forwarding to: {_startup_upstream.scheme}://{_startup_upstream.host}:{_startup_upstream.port}")
+    except UpstreamRefused as e:
+        log.warning(f"  Upstream refused at startup: {e}")
     log.info(f"  Matching: content-based (no sessions/fingerprints)")
 
     server = ThreadedHTTPServer(("127.0.0.1", LISTEN_PORT), ProxyHandler)
