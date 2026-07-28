@@ -611,7 +611,7 @@ git commit -m "feat(chain): escape control bytes in project paths before display
 
 ---
 
-### Task 5: State file — two named fields, locking, atomic replace, mode 0600
+### Task 5: State file — two named fields, atomic replace, mode 0600
 
 `abu` records the key someone else owns, so `unchain` can give the value back. `upstream` records our
 own key, which has no displaced value because nothing else writes it. See spec section 5.
@@ -626,7 +626,7 @@ own key, which has no displaced value because nothing else writes it. See spec s
   - `empty_state() -> dict` — `{"abu": None, "upstream": None, "alerted": []}`
   - `load_state() -> dict` — raises `UnparseableSettings` on bad JSON
   - `save_state(state) -> None` — atomic `os.replace`, mode `0600`
-  - `locked()` — context manager holding an exclusive lock for a verb's whole sequence
+  (No lock. Atomic `os.replace` is the whole concurrency story — see §5 Writing rules.)
 
 - [ ] **Step 1: Write the failing test**
 
@@ -638,8 +638,6 @@ Run: python3 -m unittest discover -s tests
 import os
 import stat
 import tempfile
-import threading
-import time
 import unittest
 from unittest import mock
 
@@ -662,7 +660,7 @@ class StateIOTest(unittest.TestCase):
         state["abu"] = {"path": "/p/.claude/settings.local.json",
                         "wrote": "http://127.0.0.1:5588",
                         "displaced": "http://127.0.0.1:8787"}
-        state["upstream"] = {"wrote": "http://127.0.0.1:8787", "refs": ["/p"]}
+        state["upstream"] = {"wrote": "http://127.0.0.1:8787"}
         chain.save_state(state)
         self.assertEqual(chain.load_state(), state)
 
@@ -670,7 +668,7 @@ class StateIOTest(unittest.TestCase):
         # It is our own key. Recording a value to restore to is what produced the
         # ordering bug an earlier draft had -- the field is deliberately absent.
         state = chain.empty_state()
-        state["upstream"] = {"wrote": "http://127.0.0.1:8787", "refs": ["/p"]}
+        state["upstream"] = {"wrote": "http://127.0.0.1:8787"}
         chain.save_state(state)
         self.assertNotIn("displaced", chain.load_state()["upstream"])
 
@@ -697,25 +695,6 @@ class StateIOTest(unittest.TestCase):
         with open(chain.state_path(), encoding="utf-8") as f:
             self.assertEqual(f.read(), "{ broken")
 
-    def test_lock_serializes_two_holders(self):
-        order = []
-
-        def hold(tag, delay):
-            with chain.locked():
-                order.append(f"{tag}-in")
-                time.sleep(delay)
-                order.append(f"{tag}-out")
-
-        first = threading.Thread(target=hold, args=("a", 0.3))
-        first.start()
-        time.sleep(0.05)
-        second = threading.Thread(target=hold, args=("b", 0.0))
-        second.start()
-        first.join()
-        second.join()
-        self.assertEqual(order, ["a-in", "a-out", "b-in", "b-out"])
-
-
 if __name__ == "__main__":
     unittest.main()
 ```
@@ -727,63 +706,22 @@ if __name__ == "__main__":
 
 - [ ] **Step 3: Write the minimal implementation**
 
-  Append to `proxy/chain.py`. The lock import is platform-split so the module still imports on
-  Windows, where `fcntl` does not exist and every `.ps1` caller would otherwise break.
+  Append to `proxy/chain.py`. No `fcntl` anywhere, so nothing here can break the `.ps1` callers on
+  Windows — `os.replace` is atomic on both platforms.
 
 ```python
 import contextlib
 import tempfile
-
-if os.name == "nt":
-    import msvcrt
-
-    def _lock(fh):
-        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
-
-    def _unlock(fh):
-        fh.seek(0)
-        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-else:
-    import fcntl
-
-    def _lock(fh):
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-
-    def _unlock(fh):
-        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
 def state_path():
     return os.path.join(os.path.expanduser("~"), ".claude", "rolling-context-proxy.json")
 
 
-def lock_path():
-    return state_path() + ".lock"
-
-
 def empty_state():
     """abu: the key someone else owns, so it carries what we displaced.
     upstream: our own key, so it carries only who is still chained through it."""
     return {"abu": None, "upstream": None, "alerted": []}
-
-
-@contextlib.contextmanager
-def locked():
-    """Hold the exclusive lock for a verb's whole sequence -- guards, writes, read-backs, save.
-
-    Held this widely on purpose: D10 permits concurrent chain calls from different projects, and a
-    narrower scope lets two applies interleave their read-backs against each other's writes.
-    """
-    os.makedirs(os.path.dirname(lock_path()), exist_ok=True)
-    fh = open(lock_path(), "a+")
-    try:
-        _lock(fh)
-        yield
-    finally:
-        try:
-            _unlock(fh)
-        finally:
-            fh.close()
 
 
 def load_state():
@@ -816,7 +754,7 @@ def save_state(state):
 - [ ] **Step 4: Run and verify it passes**
 
   Run: `python3 -m unittest tests.test_state_io -v`
-  Expected: PASS, 8 tests.
+  Expected: PASS, 7 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -834,7 +772,7 @@ The user-visible fix. `chain` is the single command from R2; `unchain` gives bac
 
 **Files:**
 - Modify: `proxy/chain.py`
-- Test: `tests/test_chain_verb.py`, `tests/test_unchain_refs.py`, `tests/test_status_verb.py`
+- Test: `tests/test_chain_verb.py`, `tests/test_unchain_verb.py`, `tests/test_status_verb.py`
 
 **Interfaces:**
 - Consumes: `is_self`, `effective`, `display`, `load_state`, `save_state`, `locked`,
@@ -906,7 +844,7 @@ class ChainVerbTest(unittest.TestCase):
         state = chain.load_state()
         self.assertEqual(state["abu"]["displaced"], FOREIGN)
         self.assertEqual(state["abu"]["path"], self.local)
-        self.assertEqual(state["upstream"]["refs"], [self.project])
+        self.assertEqual(state["upstream"]["wrote"], FOREIGN)
         self.assertNotIn("displaced", state["upstream"])
 
     def test_nothing_to_chain_is_an_exit_zero_noop(self):
@@ -965,7 +903,7 @@ class ChainVerbTest(unittest.TestCase):
         with open(os.path.join(other, ".claude", "settings.local.json"), "w") as f:
             json.dump({"env": {"ANTHROPIC_BASE_URL": FOREIGN}}, f)
         self.assertEqual(chain.do_chain(other, assume_yes=True), 0)
-        self.assertEqual(chain.load_state()["upstream"]["refs"], [self.project, other])
+        self.assertEqual(chain.load_state()["upstream"]["wrote"], FOREIGN)
 
     def test_env_override_without_displacement_is_a_noop_not_a_refusal(self):
         # A user with a legitimate ROLLING_CONTEXT_UPSTREAM and nothing displacing them
@@ -1033,19 +971,28 @@ class UnchainTest(unittest.TestCase):
         self.assertEqual(chain.do_unchain(a), 0)
         self.assertEqual(self._local_env(a)["ANTHROPIC_BASE_URL"], FOREIGN)
 
-    def test_deletes_our_own_key_when_last_ref_leaves(self):
+    def test_all_deletes_our_own_key(self):
         a = self._project("a")
         chain.do_chain(a, assume_yes=True)
-        chain.do_unchain(a)
+        chain.do_unchain(a, all_=True)
         self.assertNotIn("ROLLING_CONTEXT_UPSTREAM", self._user_env())
 
-    def test_other_projects_keep_the_key(self):
+    def test_plain_unchain_leaves_our_own_key_set(self):
+        # It is inert for this project once ANTHROPIC_BASE_URL is restored, and a second
+        # project may still be chained through it. Only --all removes it (D10).
         a, b = self._project("a"), self._project("b")
         chain.do_chain(a, assume_yes=True)
         chain.do_chain(b, assume_yes=True)
         chain.do_unchain(a)
         self.assertEqual(self._user_env()["ROLLING_CONTEXT_UPSTREAM"], FOREIGN)
-        self.assertEqual(chain.load_state()["upstream"]["refs"], [b])
+
+    def test_a_second_project_still_resolves_after_the_first_unchains(self):
+        a, b = self._project("a"), self._project("b")
+        chain.do_chain(a, assume_yes=True)
+        chain.do_chain(b, assume_yes=True)
+        chain.do_unchain(a)
+        self.assertTrue(chain.is_self(self._local_env(b)["ANTHROPIC_BASE_URL"]))
+        self.assertEqual(self._user_env()["ROLLING_CONTEXT_UPSTREAM"], FOREIGN)
 
     def test_deleted_base_url_is_skipped_not_resurrected(self):
         # headroom removes this key when it exits (wrap.py:1779-1781).
@@ -1056,12 +1003,14 @@ class UnchainTest(unittest.TestCase):
         self.assertEqual(chain.do_unchain(a), 0)
         self.assertNotIn("ANTHROPIC_BASE_URL", self._local_env(a))
 
-    def test_all_clears_every_reference(self):
-        a, b = self._project("a"), self._project("b")
+    def test_all_skips_when_the_key_is_no_longer_ours(self):
+        a = self._project("a")
         chain.do_chain(a, assume_yes=True)
-        chain.do_chain(b, assume_yes=True)
+        path = os.path.join(self.home, ".claude", "settings.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"env": {"ROLLING_CONTEXT_UPSTREAM": "http://127.0.0.1:9999"}}, f)
         self.assertEqual(chain.do_unchain(a, all_=True), 0)
-        self.assertNotIn("ROLLING_CONTEXT_UPSTREAM", self._user_env())
+        self.assertEqual(self._user_env()["ROLLING_CONTEXT_UPSTREAM"], "http://127.0.0.1:9999")
 
     def test_no_project_ancestor_is_an_exit_zero_report(self):
         self.assertEqual(chain.do_unchain(self.home), 0)
@@ -1124,12 +1073,12 @@ class StatusTest(unittest.TestCase):
         self.assertEqual(open(chain.state_path(), "rb").read(), before_state)
         self.assertEqual(open(local, "rb").read(), before_local)
 
-    def test_names_a_recorded_project_that_no_longer_exists(self):
+    def test_reports_the_recorded_upstream(self):
         state = chain.empty_state()
-        state["upstream"] = {"wrote": FOREIGN, "refs": ["/gone/project"]}
+        state["upstream"] = {"wrote": FOREIGN}
         chain.save_state(state)
         _, out = self._run()
-        self.assertIn("/gone/project", out)
+        self.assertIn("8787", out)
 
 
 if __name__ == "__main__":
@@ -1138,7 +1087,7 @@ if __name__ == "__main__":
 
 - [ ] **Step 2: Run and verify all three fail**
 
-  Run: `python3 -m unittest tests.test_chain_verb tests.test_unchain_refs tests.test_status_verb -v`
+  Run: `python3 -m unittest tests.test_chain_verb tests.test_unchain_verb tests.test_status_verb -v`
   Expected: FAIL — `AttributeError: module 'proxy.chain' has no attribute 'do_chain'`
 
 - [ ] **Step 3: Write the minimal implementation**
@@ -1249,43 +1198,39 @@ def _confirm(url, assume_yes):
 
 def do_chain(project, assume_yes=False):
     try:
-        with locked():
-            state = load_state()
-            try:
-                url, source = _guards(project, state)
-            except Refusal as r:
-                print(f"not chained — {r.message}")
-                return 2
-            if url is None:
-                print("no foreign proxy detected — nothing to chain")
-                return 0
-            if not _confirm(url, assume_yes):
-                print("not chained — confirmation declined. re-run with --yes to skip the prompt")
-                return 2
-
-            ours = f"http://127.0.0.1:{our_bind()[1]}"
-            state["abu"] = {"path": source, "wrote": ours, "displaced": url}
-            upstream = state.get("upstream") or {"wrote": url, "refs": []}
-            if project not in upstream["refs"]:
-                upstream["refs"].append(project)
-            state["upstream"] = upstream
-            save_state(state)
-
-            # Upstream first: reversing this points Claude Code at us before we know where to
-            # forward, and "no upstream recorded" resolves to the default API -- silently
-            # un-chaining the user, which D9 forbids.
-            _write_key(user_settings_path(), USER_KEY, url)
-            _write_key(source, ABU_KEY, ours)
-
-            if _read_key(user_settings_path(), USER_KEY) != url or \
-               _read_key(source, ABU_KEY) != ours:
-                _write_key(source, ABU_KEY, url)
-                _write_key(user_settings_path(), USER_KEY, None)
-                save_state(empty_state())
-                print("not chained — read-back failed, changes undone")
-                return 1
-            print(f"chained: {display(url)} is now upstream; rolling-context is back in the path")
+        state = load_state()
+        try:
+            url, source = _guards(project, state)
+        except Refusal as r:
+            print(f"not chained — {r.message}")
+            return 2
+        if url is None:
+            print("no foreign proxy detected — nothing to chain")
             return 0
+        if not _confirm(url, assume_yes):
+            print("not chained — confirmation declined. re-run with --yes to skip the prompt")
+            return 2
+
+        ours = f"http://127.0.0.1:{our_bind()[1]}"
+        state["abu"] = {"path": source, "wrote": ours, "displaced": url}
+        state["upstream"] = {"wrote": url}
+        save_state(state)
+
+        # Upstream first: reversing this points Claude Code at us before we know where to
+        # forward, and "no upstream recorded" resolves to the default API -- silently
+        # un-chaining the user, which D9 forbids.
+        _write_key(user_settings_path(), USER_KEY, url)
+        _write_key(source, ABU_KEY, ours)
+
+        if _read_key(user_settings_path(), USER_KEY) != url or \
+           _read_key(source, ABU_KEY) != ours:
+            _write_key(source, ABU_KEY, url)
+            _write_key(user_settings_path(), USER_KEY, None)
+            save_state(empty_state())
+            print("not chained — read-back failed, changes undone")
+            return 1
+        print(f"chained: {display(url)} is now upstream; rolling-context is back in the path")
+        return 0
     except UnparseableSettings as e:
         print(f"not chained — {display(e.path)} is not valid JSON — refusing to touch it. "
               f"fix the file by hand and retry")
@@ -1294,47 +1239,42 @@ def do_chain(project, assume_yes=False):
 
 def do_unchain(project, all_=False):
     try:
-        with locked():
-            state = load_state()
-            root = project if all_ else project_root(project)
-            if root is None and not all_:
-                print("nothing project-scoped to unchain here")
-                return 0
-
-            abu = state.get("abu")
-            if abu:
-                if _read_key(abu["path"], ABU_KEY) == abu["wrote"]:
-                    _write_key(abu["path"], ABU_KEY, abu["displaced"])
-                else:
-                    print(f"skipped {display(abu['path'])} — {ABU_KEY} is no longer ours")
-                state["abu"] = None
-
-            upstream = state.get("upstream")
-            if upstream:
-                if all_:
-                    upstream["refs"] = []
-                elif root in upstream["refs"]:
-                    upstream["refs"].remove(root)
-                if upstream["refs"]:
-                    names = ", ".join(display(p) for p in upstream["refs"])
-                    print(f"left {USER_KEY} set — still chained by: {names}")
-                    state["upstream"] = upstream
-                else:
-                    if _read_key(user_settings_path(), USER_KEY) == upstream["wrote"]:
-                        _write_key(user_settings_path(), USER_KEY, None)
-                    else:
-                        print(f"skipped {USER_KEY} — it is no longer ours")
-                    state["upstream"] = None
-            save_state(state)
-            print("unchained")
+        state = load_state()
+        root = project if all_ else project_root(project)
+        if root is None and not all_:
+            print("nothing project-scoped to unchain here")
             return 0
+
+        # Give back the key someone else owns.
+        abu = state.get("abu")
+        if abu:
+            if _read_key(abu["path"], ABU_KEY) == abu["wrote"]:
+                _write_key(abu["path"], ABU_KEY, abu["displaced"])
+            else:
+                print(f"skipped {display(abu['path'])} — {ABU_KEY} is no longer ours")
+            state["abu"] = None
+
+        # Our own key is left set. Restoring ANTHROPIC_BASE_URL above already took this
+        # project out of the request path, so the upstream value is inert for it -- and
+        # another project may still be chained through it (D10). Only --all removes it,
+        # which is what uninstall passes and means "nothing is chained any more".
+        upstream = state.get("upstream")
+        if upstream and all_:
+            if _read_key(user_settings_path(), USER_KEY) == upstream["wrote"]:
+                _write_key(user_settings_path(), USER_KEY, None)
+            else:
+                print(f"skipped {USER_KEY} — it is no longer ours")
+            state["upstream"] = None
+        save_state(state)
+        print("unchained")
+        return 0
     except UnparseableSettings as e:
         print(f"not unchained — {display(e.path)} is not valid JSON — refusing to touch it")
         return 2
 
 
 def do_status(project):
-    """Reports. Never writes, takes no lock -- a command run anytime must not mutate state."""
+    """Reports. Never writes -- a command run anytime must not mutate state."""
     port = our_bind()[1]
     print(f"rolling-context: port {port}")
     try:
@@ -1354,10 +1294,6 @@ def do_status(project):
     upstream = state.get("upstream")
     if upstream:
         print(f"chained:  yes -- upstream {display(upstream['wrote'])}")
-        for ref in upstream["refs"]:
-            if not os.path.isdir(os.path.join(ref, ".claude")):
-                print(f"stale:    {display(ref)} is recorded as chained but no longer exists")
-                print(f"          {USER_KEY} stays set until the next chain or unchain clears it")
     else:
         print("chained:  no")
 
@@ -1404,13 +1340,13 @@ def main(argv):
 
 - [ ] **Step 4: Run and verify they pass**
 
-  Run: `python3 -m unittest tests.test_chain_verb tests.test_unchain_refs tests.test_status_verb -v`
+  Run: `python3 -m unittest tests.test_chain_verb tests.test_unchain_verb tests.test_status_verb -v`
   Expected: PASS, 23 tests.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add proxy/chain.py tests/test_chain_verb.py tests/test_unchain_refs.py tests/test_status_verb.py
+git add proxy/chain.py tests/test_chain_verb.py tests/test_unchain_verb.py tests/test_status_verb.py
 git commit -m "feat(chain): chain, unchain and status verbs"
 ```
 
