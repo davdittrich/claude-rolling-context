@@ -31,9 +31,10 @@ _ENV_KEYS = (
 
 
 class NativeModePredicateTest(unittest.TestCase):
-    """NATIVE_MODE is a module-level constant computed at import time from
-    the environment, so these tests reload the module under a controlled
-    environment rather than mutating live globals."""
+    """native_mode() is computed fresh on every call from the environment;
+    these tests still reload the module under a controlled environment
+    rather than mutating live globals, to keep os.environ mutations
+    isolated per test."""
 
     def setUp(self):
         self._saved = {k: os.environ.get(k) for k in _ENV_KEYS}
@@ -55,21 +56,20 @@ class NativeModePredicateTest(unittest.TestCase):
 
     def test_model_set_disables_native(self):
         mod = self._reload(ROLLING_CONTEXT_MODEL="claude-opus-4-1-20250805")
-        self.assertFalse(mod.NATIVE_MODE)
+        self.assertFalse(mod.native_mode())
 
     def test_model_unset_keeps_native(self):
         mod = self._reload()
-        self.assertTrue(mod.NATIVE_MODE)
+        self.assertTrue(mod.native_mode())
 
     def test_model_set_alongside_other_native_defaults(self):
-        # Sanity: it's specifically MODEL_SET tripping the switch, not a stale
-        # SUMMARIZER_* default.
+        # Sanity: it's specifically the model var tripping the switch, not a
+        # stale SUMMARIZER_* default.
         mod = self._reload(ROLLING_CONTEXT_MODEL="qwen3:8b")
-        self.assertTrue(mod.MODEL_SET)
-        self.assertFalse(mod.SUMMARIZER_URL_SET)
+        self.assertTrue(bool(mod.SUMMARIZER_MODEL))
         self.assertEqual(mod.SUMMARIZER_API_KEY, "")
         self.assertEqual(mod.SUMMARIZER_FORMAT, "anthropic")
-        self.assertFalse(mod.NATIVE_MODE)
+        self.assertFalse(mod.native_mode())
 
 
 class SummarizeNativeModelTest(unittest.TestCase):
@@ -135,21 +135,20 @@ class SingleSourceModelTest(unittest.TestCase):
         self.assertEqual(comp.SUMMARIZER_MODEL, "claude-opus-4-1-20250805")
         self.assertEqual(srv.SUMMARIZER_MODEL, comp.SUMMARIZER_MODEL)
         self.assertEqual(srv.compressor.summarizer_model, comp.SUMMARIZER_MODEL)
-        self.assertFalse(comp.NATIVE_MODE)
-        self.assertFalse(srv.NATIVE_MODE)
+        self.assertFalse(comp.native_mode())
 
     def test_server_and_compressor_agree_when_model_unset(self):
         comp, srv = self._reload_both()
         self.assertEqual(comp.SUMMARIZER_MODEL, "")
         self.assertEqual(srv.SUMMARIZER_MODEL, comp.SUMMARIZER_MODEL)
         self.assertEqual(srv.compressor.summarizer_model, comp.SUMMARIZER_MODEL)
-        self.assertTrue(comp.NATIVE_MODE)
-        self.assertTrue(srv.NATIVE_MODE)
+        self.assertTrue(comp.native_mode())
 
     def test_only_compressor_reads_the_env_var(self):
-        # Code-structure guard for the DoD: exactly one
-        # os.environ.get("ROLLING_CONTEXT_MODEL") in the whole proxy package,
-        # and it lives in compressor.py (the single owner).
+        # Code-structure guard for the DoD: both occurrences of
+        # os.environ.get("ROLLING_CONTEXT_MODEL") in the whole proxy package
+        # live in compressor.py (the single owner) -- native_mode() reads it
+        # fresh alongside the SUMMARIZER_MODEL display constant.
         needle = 'os.environ.get("ROLLING_CONTEXT_MODEL")'
         proxy_dir = os.path.join(os.path.dirname(__file__), "..", "proxy")
         hits = []
@@ -160,7 +159,7 @@ class SingleSourceModelTest(unittest.TestCase):
             with open(path, encoding="utf-8") as f:
                 count = f.read().count(needle)
             hits.extend([fname] * count)
-        self.assertEqual(hits, ["compressor.py"])
+        self.assertEqual(hits, ["compressor.py", "compressor.py"])
 
 
 if __name__ == "__main__":

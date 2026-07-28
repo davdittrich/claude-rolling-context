@@ -29,7 +29,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
 import chain
-from compressor import RollingCompressor, SUMMARY_MARKER, NATIVE_MODE, SUMMARIZER_FORMAT, SUMMARIZER_MODEL
+from compressor import RollingCompressor, SUMMARY_MARKER, native_mode, SUMMARIZER_FORMAT, SUMMARIZER_MODEL
 
 class FlushFileHandler(logging.FileHandler):
     def emit(self, record):
@@ -944,7 +944,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "keep_turns": compressor.keep_turns,
             "keep_floor": compressor.keep_floor,
             "summarizer_model": SUMMARIZER_MODEL or "(session model)",
-            "summarizer_mode": "native" if NATIVE_MODE else f"flattened/{SUMMARIZER_FORMAT}",
+            "summarizer_mode": "native" if native_mode() else f"flattened/{SUMMARIZER_FORMAT}",
             "upstream_url": upstream_url,
             "upstream_source": upstream_source,
             "chained": chained,
@@ -1255,7 +1255,7 @@ def main():
     log.info(f"  Keep recent turns: {compressor.keep_floor}..{compressor.keep_turns} user-turns")
     log.info(f"  Summarizer model: {SUMMARIZER_MODEL or '(session model)'}")
     log.info(f"  Summarizer mode: "
-             f"{'native (cloned session request, prompt-cached)' if NATIVE_MODE else f'flattened/{SUMMARIZER_FORMAT}'}")
+             f"{'native (cloned session request, prompt-cached)' if native_mode() else f'flattened/{SUMMARIZER_FORMAT}'}")
     try:
         _startup_upstream = current_upstream()
         log.info(f"  Forwarding to: {_startup_upstream.scheme}://{_startup_upstream.host}:{_startup_upstream.port}")
