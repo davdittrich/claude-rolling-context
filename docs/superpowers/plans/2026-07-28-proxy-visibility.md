@@ -1444,7 +1444,7 @@ writes settings that the running proxy never reads, and R3 (no restart) is unrea
 - Test: `tests/test_upstream_reaches_socket.py`, `tests/test_server_upstream.py`,
   `tests/test_dead_upstream.py`, `tests/test_summarizer_follows.py`,
   `tests/test_loop_protection.py`, `tests/test_response_header_logging.py`,
-  `tests/test_health_chain_fields.py`, `tests/test_upstream_drift.py`
+  `tests/test_health_chain_fields.py`
 
 **Interfaces:**
 - Consumes: `chain.is_self`, `chain.read_settings` (Tasks 2–3).
@@ -1759,10 +1759,11 @@ def test_our_own_address_falls_through_to_the_default_api(self):
 
   `/health` gains `chained` and `upstream_reachable` beside the sanitized `upstream_url` and
   `upstream_source`, so `status` reads them rather than duplicating probe logic. The URL is
-  re-serialized from the parsed `Upstream`, never echoed raw. `SessionStart` additionally compares
-  the live `ROLLING_CONTEXT_UPSTREAM` against `upstream.wrote` and alerts on drift (spec §8) — a
-  key that changed underneath us while `ANTHROPIC_BASE_URL` still points at us is invisible to the
-  displacement check.
+  re-serialized from the parsed `Upstream`, never echoed raw.
+
+  Drift detection belongs to the hook, not here — `SessionStart` is what compares the live
+  `ROLLING_CONTEXT_UPSTREAM` against `upstream.wrote`. Task 8 owns it, being the only task that
+  touches `hooks/start-proxy.sh`.
 
 ```python
 # tests/test_health_chain_fields.py
@@ -1775,18 +1776,6 @@ def test_health_url_is_reserialized_not_echoed(self):
     self._write_user_settings({"ROLLING_CONTEXT_UPSTREAM": "http://127.0.0.1:8787/../x"})
     self.assertNotIn("..", _health_json()["upstream_url"])
 
-# tests/test_upstream_drift.py
-def test_drift_alerts_while_we_are_still_in_the_path(self):
-    self._chain_through(FOREIGN)
-    self._write_user_settings({"ROLLING_CONTEXT_UPSTREAM": "http://127.0.0.1:9999"})
-    self.assertIn("changed outside", self._hook_stdout())
-
-def test_a_second_unrelated_drift_is_not_suppressed(self):
-    self._chain_through(FOREIGN)
-    self._write_user_settings({"ROLLING_CONTEXT_UPSTREAM": "http://127.0.0.1:9999"})
-    self._hook_stdout()
-    self._write_user_settings({"ROLLING_CONTEXT_UPSTREAM": "http://127.0.0.1:7777"})
-    self.assertIn("changed outside", self._hook_stdout())
 ```
 
 - [ ] **Step 5: Loop protection and response-header filtering**
@@ -1827,7 +1816,7 @@ def test_a_different_chained_from_address_forwards_normally(self):
 
   Run: `python3 -m unittest tests.test_upstream_reaches_socket tests.test_server_upstream \
     tests.test_dead_upstream tests.test_summarizer_follows tests.test_loop_protection \
-    tests.test_response_header_logging tests.test_health_chain_fields tests.test_upstream_drift -v`
+    tests.test_response_header_logging tests.test_health_chain_fields -v`
   Expected: PASS — requests land on A then B, no restart.
   Run: `python3 -m unittest discover -s tests`
   Expected: the whole suite green, including the pre-existing compression tests.
@@ -1839,7 +1828,7 @@ git add proxy/server.py proxy/compressor.py hooks/start-proxy.sh \
         tests/test_upstream_reaches_socket.py tests/test_server_upstream.py \
         tests/test_dead_upstream.py tests/test_summarizer_follows.py \
         tests/test_loop_protection.py tests/test_response_header_logging.py \
-        tests/test_health_chain_fields.py tests/test_upstream_drift.py
+        tests/test_health_chain_fields.py
 git commit -m "fix(proxy): resolve upstream per request, not at import
 
 server.py:100 froze the upstream for the daemon's lifetime, so a live proxy
@@ -1860,7 +1849,8 @@ value and prints "already".
 
 **Files:**
 - Modify: `hooks/start-proxy.sh:59-66`, `install.sh:59-66`
-- Test: `tests/test_hook_output.py`, `tests/test_install_seeding.py`
+- Test: `tests/test_hook_output.py`, `tests/test_install_seeding.py`,
+  `tests/test_upstream_drift.py`
 
 **Interfaces:**
 - Consumes: `chain.py is-self` (CLI, Task 2), `chain.effective` (Task 3).
@@ -2023,6 +2013,91 @@ fi
   Apply the same three cases to `install.sh:59-68`. Neither file writes
   `ROLLING_CONTEXT_UPSTREAM` any more; `chain` does that, explicitly and recorded.
 
+- [ ] **Step 3a: Suppress a repeat alert, and detect drift**
+
+  Two behaviours from spec §8 that the hook owns. Without the first, the alert fires every session
+  forever — the user learns to ignore it, which is the same silence this feature exists to break,
+  reached from the other direction.
+
+  **Suppression (D8), keyed per `{project, url}`.** Headroom binds a fixed port, so a URL-only key
+  would alert once in the lifetime of the install and stay silent in every project after the first.
+
+```python
+# proxy/chain.py -- the hook owns no state logic of its own.
+def should_alert(project, url):
+    """(alert?, kind) for this session. Records the pair when it decides to alert."""
+    state = load_state()
+    seen = {(a["project"], a["url"]) for a in state.get("alerted") or []}
+    ours = (state.get("abu") or {}).get(project)
+    if (project, url) not in seen:
+        state.setdefault("alerted", []).append({"project": project, "url": url})
+        save_state(state)
+        return True, ("overwritten" if ours else "displaced")
+    if ours:
+        # We chained here and something took it back. Say so every time, in different words.
+        return True, "overwritten"
+    return False, None
+
+
+def drifted():
+    """(old, new) when ROLLING_CONTEXT_UPSTREAM changed underneath us, else None.
+
+    Invisible to the displacement check: ANTHROPIC_BASE_URL still points at us, so from that
+    angle nothing changed -- but we are now chaining somewhere the user did not choose.
+    """
+    state = load_state()
+    upstream = state.get("upstream")
+    if not upstream:
+        return None
+    live = (read_settings(user_settings_path()).get("env") or {}).get(USER_KEY)
+    return None if live == upstream["wrote"] else (upstream["wrote"], live)
+```
+
+  The hook calls `chain.py should-alert <url>` and `chain.py drifted`, and emits at most one JSON
+  object per session — the displacement alert, the "your chain was overwritten" variant, or the
+  drift alert. Exact texts are in spec §8; route both verbs through `main()`.
+
+```python
+# tests/test_upstream_drift.py
+def test_drift_alerts_while_we_are_still_in_the_path(self):
+    self._chain_through(FOREIGN)
+    self._set_user_upstream("http://127.0.0.1:9999")
+    self.assertIn("changed outside", self._hook_stdout())
+
+def test_no_drift_alert_when_the_value_is_still_ours(self):
+    self._chain_through(FOREIGN)
+    self.assertEqual(self._hook_stdout().strip(), "")
+
+def test_a_second_unrelated_drift_is_not_suppressed(self):
+    self._chain_through(FOREIGN)
+    self._set_user_upstream("http://127.0.0.1:9999")
+    self._hook_stdout()
+    self._set_user_upstream("http://127.0.0.1:7777")
+    self.assertIn("changed outside", self._hook_stdout())
+```
+
+  And in `tests/test_hook_output.py`, the three suppression rows:
+
+```python
+def test_the_second_session_is_silent(self):
+    self._displace()
+    self.assertIn("8787", self._run().stdout)
+    self.assertEqual(self._run().stdout.strip(), "")
+
+def test_a_different_project_is_alerted_for_the_same_url(self):
+    # Precisely why the key is {project, url} and not url alone.
+    self._displace()
+    self._run()
+    other = self._new_project_displaced_by(FOREIGN)
+    self.assertIn("8787", self._run_in(other).stdout)
+
+def test_a_displaced_chain_re_alerts_with_different_wording(self):
+    self._displace()
+    self._chain()
+    self._displace()
+    self.assertIn("overwritten", self._run().stdout)
+```
+
 - [ ] **Step 3b: Add the test seam both test files depend on**
 
   `tests/test_hook_output.py` and `tests/test_install_seeding.py` run these scripts for real, and
@@ -2043,7 +2118,7 @@ fi
 - [ ] **Step 4: Run and verify they pass**
 
   Run: `python3 -m unittest tests.test_hook_output tests.test_install_seeding -v`
-  Expected: PASS, 8 tests.
+  Expected: PASS, 14 tests.
 
 - [ ] **Step 5: Full suite and a real end-to-end check**
 
@@ -2213,7 +2288,9 @@ So: chain, then uninstall, and Claude Code is left pointing at a dead `:5588` wi
 connectivity at all. This plan introduces that path, so this plan closes it.
 
 **Files:**
-- Modify: `uninstall.sh:42-51` (ordering), `:89-127` (settings block), `:92-95` (silent skip)
+- Modify: `uninstall.sh:42-51` (ordering), `:89-127` (settings block), `:92-95` (silent skip),
+  `:111` (the last unmigrated `is_self` site — spec §9 lists it explicitly)
+- Modify: `uninstall.ps1` — the same reorder, shipped review-verified only (D3, `pwsh` absent)
 - Test: `tests/test_uninstall.py`
 
 **Interfaces:**
@@ -2300,7 +2377,27 @@ if __name__ == "__main__":
   handling of `ROLLING_CONTEXT_*` then finds nothing left to do, which is correct rather than
   redundant — without the ordering it would restore `ANTHROPIC_BASE_URL` to a possibly-dead port.
   Make the interpreter guard at `:92-95` report what it skipped instead of skipping silently under
-  `set -e`. Remove `rolling-context-proxy.json` and its `.lock`.
+  `set -e`. Remove `rolling-context-proxy.json`.
+
+  **Migrate the predicate at `:111`.** It currently reads `if current and "127.0.0.1" in current:` —
+  the same loopback-conflation as root bug #1, at the seventh site spec §9 lists. Leaving it has a
+  concrete regression: after `unchain --all` restores a *user-scope* foreign proxy (a legitimate
+  outcome, since `effective()` resolves across scopes and the displacing value need not be
+  project-scoped), this predicate sees a loopback address, finds `upstream` already cleared, and
+  takes the `del env["ANTHROPIC_BASE_URL"]` branch — deleting the address it just restored and
+  stripping connectivity the user still had. Replace it with `chain.py is-self`, matching the other
+  six sites.
+
+- [ ] **Step 3b: `uninstall.ps1`, review-verified**
+
+  Apply the same reorder there: `chain.py unchain --all` before any removal. This is not covered by
+  the PowerShell deferral, and the plan previously claimed it was. The deferral's reasoning —
+  "Windows users keep today's behaviour, which is the pre-existing bug" — is true of
+  `start-proxy.ps1` and false here: chaining is **new**, `commands/chain.md` invokes
+  `chain.py` with no OS gate, and `chain.py` is cross-platform. So a Windows user who runs
+  `/rolling-context:chain` and later uninstalls is stranded on a dead `:5588` by a path this plan
+  creates. Per D3 the change ships review-verified with `pwsh-absent` recorded in the commit body;
+  what is not acceptable is leaving it unwritten.
 
 - [ ] **Step 4: Run and verify it passes**
 
@@ -2337,7 +2434,12 @@ Claude Code pointing at a dead :5588 with no API connectivity."
 
 | Deferred | Why |
 |---|---|
-| PowerShell parity (`start-proxy.ps1:46`, `install.ps1:52`, `uninstall.ps1:101`) | `pwsh` is absent on this machine (D3), so those changes would ship unverified. POSIX users get the whole feature; Windows users keep today's behaviour, which is the pre-existing bug, not a new one. This is the one deferral, and it is a platform gap rather than a scope choice. |
+| PowerShell detection and seeding parity (`start-proxy.ps1:46`, `install.ps1:52`) | `pwsh` is absent on this machine (D3), so these ship unverified or not at all. Windows users keep today's behaviour on these two paths — and here "pre-existing" is accurate: `start-proxy.ps1:46` already compares against our own port rather than a bare loopback substring, so it does not carry root bug #1. What it does carry is the old silent-write behaviour, which is a pre-existing divergence from D9/D14, not something this plan introduces. |
+
+`uninstall.ps1` is **not** deferred, despite `pwsh` being absent. Chaining is new and has no OS
+gate, so a Windows user can reach the stranded-on-`:5588` state that Task 10 exists to prevent. The
+reorder ships review-verified there (Task 10 Step 3b) rather than being left out on a platform
+technicality.
 
 Nothing else is deferred. The slash commands were briefly deferred as "ergonomics" and that was wrong
 — the alert names them, so shipping the alert without them would fail R2 at the moment it fires.
