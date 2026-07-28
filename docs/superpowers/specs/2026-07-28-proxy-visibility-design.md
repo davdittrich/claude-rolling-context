@@ -929,4 +929,28 @@ actually uses — and record the result here as a measured fact. If the measurem
 contradicts the assumption, the guard's refusal message and the tier order both
 change.
 
-Next step after that item is recorded: `writing-plans`.
+### Review provenance
+
+The design-review-gate ran to approval on all five reviewers: Product Manager and
+Designer at `cdb1733`, Security at `bc2ea57`, CTO at `cd3d806`, Architect at
+`891011b`. Later commits changed no verb, no state field, and no message the
+earlier approvals rested on, except as noted below.
+
+**Not independently reviewed.** Four strings were added after the Designer's
+approval and four attempts to re-run that review died on harness faults, not on
+findings. The user elected to proceed. They are:
+
+- `status`'s stale block (`stale: <project> is recorded as chained…`)
+- `unchain`'s still-referenced message (`left ROLLING_CONTEXT_UPSTREAM set — still
+  chained by: …`)
+- the `declined` guard message
+- the `write-target-escapes-project` guard message
+
+Each follows the conventions the Designer did approve — lowercase, no terminal
+punctuation, state-then-remedy, bare verb for terminal readers. One known nit,
+worth fixing while implementing rather than tracking separately:
+`write-target-escapes-project` names the mechanism but not the consequence, unlike
+every other row in that table, so a user cannot tell from it whether their project
+is broken or merely unchained.
+
+Next step after §12's probe is recorded: `writing-plans`.
