@@ -274,6 +274,24 @@ considers only other projects' entries, so a `chain` re-run from a project whose
 recorded path spelling differs cannot delete its own reference out from under
 itself.
 
+**Recorded paths are sanitized before they are shown, exactly as URLs are.** A
+project directory name is chosen by whoever created it — any bytes but NUL and
+`/`, including terminal escape sequences and text written to read as an
+instruction — and it arrives on the machine through an ordinary `git clone`. It is
+therefore no more trusted than a chained URL. Per D6 these verbs also ship as
+slash commands, so `status` and `unchain` output is not only a human reading a
+terminal: it is tool output the **model** reads in the same conversation. A
+`project` string is never interpolated raw into a message, a log line, or the
+state file; control and non-printable bytes are escaped first, by the same rule
+§7 applies to URLs. The earlier note in §6 about guard messages being read by a
+person in a terminal describes only their tone, never their escaping.
+
+**Write targets must stay inside the project.** `chain` writes to
+`<project>/.claude/settings.local.json`. Canonicalizing the project root does not
+constrain that path, since a clone can ship `.claude` as a symlink pointing
+anywhere; the resolved write target is therefore required to lie inside the
+resolved project root, and `chain` refuses with a named reason when it does not.
+
 **Recorded paths are canonical.** Every `project` string is `realpath`'d before it
 is stored and before any comparison — removal, prune, and the `refs` membership
 test alike. Reached through a symlink, or spelled relatively on one invocation and
@@ -281,9 +299,11 @@ absolutely on the next, the same project would otherwise fail to match its own
 entry: `unchain` would silently leave a live reference behind, and the prune would
 skip a stale one, neither hitting an error path.
 
-The one way the prune misfires is a project on a temporarily unmounted volume: it
-is pruned, and if it was the last reference the key is restored while that project
-still believes itself chained. That failure is visible rather than silent — the
+The prune misfires whenever a project's `.claude` is absent at check time while
+the project is still live — a temporarily unmounted volume, or any local process
+deleting `.claude` between one verb and the next. It is pruned, and if it was the
+last reference the key is restored while that project still believes itself
+chained. That failure is visible rather than silent — the
 project's `ANTHROPIC_BASE_URL` still points at us while `ROLLING_CONTEXT_UPSTREAM`
 no longer matches `shared_upstream.wrote`, which is exactly §8's drift alert — and
 the fix is one `chain` away. A pinned key that never restores has no such
@@ -339,7 +359,15 @@ Each traces to a specific past failure:
   prompting, and the alternative — confirm outside the lock, then acquire it and
   re-evaluate every guard before writing — buys freedom from human latency at the
   cost of a second guard pass and two places where guard results can disagree. Not
-  worth it for a prompt a person is looking at. D10 explicitly permits concurrent `chain` calls
+  worth it for a prompt a person is looking at. The block is also scoped to the
+  same principal: it is the user's own other invocation that waits, on a machine
+  whose trust boundary is already a single local user (D13, D18).
+- `chain`'s prune step can restore `original` to `~/.claude/settings.json` and
+  then overwrite it with the new upstream two steps later — two `os.replace`
+  calls on that file inside one lock hold. The flock keeps *our* read-backs
+  consistent but does not make the pair atomic to an unrelated reader, so the
+  file transiently holds the pre-chain value. Named here rather than left
+  implicit, in keeping with the rest of this section. D10 explicitly permits concurrent `chain` calls
   from different projects; without this scope two concurrent applies can
   interleave their read-backs against each other's writes.
 - POSIX: `fcntl.flock` on the state file, held for the scope above. Windows has
@@ -400,6 +428,7 @@ and writes nothing; the two no-ops exit 0.
 | `divergent-chain` | `ROLLING_CONTEXT_UPSTREAM` in `~/.claude/settings.json` is set to a different URL (D10) | 2 | `already chained to <existing>; <url> is a different proxy. run 'unchain' first if you want to switch` |
 | `upstream-pinned-by-env` | `ROLLING_CONTEXT_UPSTREAM` is set in the process environment | 2 | `ROLLING_CONTEXT_UPSTREAM is set in your shell environment (<value>) — settings can't override that. unset it or edit your shell config instead` |
 | `unparseable-settings` | a target settings file or the state file is invalid JSON | 2 | `<path> is not valid JSON — refusing to touch it. fix the file by hand and retry` |
+| `write-target-escapes-project` | `<project>/.claude/settings.local.json` resolves outside the project root, e.g. `.claude` is a symlink | 2 | `<project>/.claude does not resolve inside <project> — refusing to write through it` |
 | `declined` | the D14 scope-escalation confirmation was answered anything but `y`, or stdin is not a TTY and `--yes` was not passed | 2 | `not chained — confirmation declined. re-run with --yes to skip the prompt` |
 
 `declined` is a guard like any other: nothing is written, the state file is
@@ -808,6 +837,7 @@ because no test covered state-file version handling at all.
 | `test_unchain_verb.py` | restore vs delete on `displaced: null`; skip when our value is gone; reverse order; project-root scoping, explicitly including the no-ancestor-before-`$HOME` case that must report and exit 0 rather than treating `$HOME/.claude` as the project; `--all` |
 | `test_unchain_shared_key.py` | D17: with A and B both in `shared_upstream.refs`, A's `unchain` removes only A and leaves the key set, so B still resolves at tier 2, and the message names B as still chained; the last project out restores `original`; **out-of-order unchain** (A chains over a pre-existing value, B chains to the same URL, A unchains first, then B) still restores that pre-existing value, which is the case the previous derive-from-`writes` design got wrong; a drifted live value fails the read-back and is left alone rather than overwritten; `--all` empties `refs` in one pass and takes the same guarded restore branch; a `refs` entry whose project is gone is pruned by `chain` and `unchain`, and when it was the last reference the key is restored rather than pinned forever; the prune fires on a project whose `.claude` was deleted while the project root survives, not only on a deleted root; a verb never prunes its own project's entry; paths are `realpath`'d before storage and before every comparison, so a symlinked or relatively-spelled project still matches its own entry; the `shared_upstream` object is gone from the state file after `refs` empties, on both the restored and the read-back-skipped path |
 | `test_loop_protection.py` | D16: a request carrying our own address in `X-Rolling-Context-Chained-From` is refused as a loop; a genuinely different chained-from address forwards normally; an alternate loopback spelling (`localhost` vs `127.0.0.1`) is still caught; the emitted value tracks the live bind address rather than a constant |
+| `test_path_sanitizing.py` | a project directory whose name carries terminal escape sequences or instruction-shaped text reaches `status` output, `unchain` output, the log and the state file escaped, never raw — the same rule `test_dead_upstream.py` pins for URLs; a `.claude` symlink pointing outside the project root is refused by `chain` with the named reason rather than written through |
 | `test_state_io.py` | atomic replace; refusal on unparseable state; flock under contention; the file is created mode `0600`, on both the create and the `os.replace` rewrite path; a chained URL written to the state file is re-serialized from the parsed `Upstream`, never the raw string |
 | `test_server_upstream.py` | all four tiers, each `is_self`-guarded; cache invalidation on `mtime_ns` change; D18 — a non-loopback value at tier 2 or 3 is refused and names the offending file, while the same value at tier 1 is honoured |
 | `test_upstream_reaches_socket.py` | the actual frozen-upstream defect: with the daemon running and **not** restarted, change the settings upstream between two requests and assert the second request arrives at the *second* in-process listener. Unmocked sockets — this is the one test that fails if resolution is merely re-parsed and cached without reaching the connection factory (`server.py:151-161`) and the derived sites (`:634`, `:767`, `:865`, `:869`, `:1065`). Every other row in this table passes against a naive string-only fix; this is what `Gemini-b9b.6` actually promises |
