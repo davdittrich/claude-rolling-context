@@ -46,7 +46,18 @@ class ChainVerbTest(unittest.TestCase):
 
     def test_chain_writes_both_keys_upstream_first(self):
         self._displace()
-        self.assertEqual(chain.do_chain(self.project, assume_yes=True), 0)
+        calls = []
+        real_write_key = chain._write_key
+
+        def recording(path, key, value):
+            calls.append((key, value))
+            return real_write_key(path, key, value)
+
+        with mock.patch.object(chain, "_write_key", side_effect=recording):
+            self.assertEqual(chain.do_chain(self.project, assume_yes=True), 0)
+        keys_written = [key for key, _ in calls]
+        self.assertLess(keys_written.index(chain.USER_KEY), keys_written.index(chain.ABU_KEY),
+                         "ROLLING_CONTEXT_UPSTREAM must land before ANTHROPIC_BASE_URL")
         self.assertEqual(self._user_env()["ROLLING_CONTEXT_UPSTREAM"], FOREIGN)
         self.assertTrue(chain.is_self(self._local_env()["ANTHROPIC_BASE_URL"]))
 
@@ -147,6 +158,32 @@ class ChainVerbTest(unittest.TestCase):
         self.assertEqual(chain.do_chain(self.project, assume_yes=True), 2)
         with open(self.local, encoding="utf-8") as f:
             self.assertEqual(f.read(), "{ broken")
+
+    def test_refuses_when_upstream_key_is_already_set_by_someone_else(self):
+        # I3: a pre-existing ROLLING_CONTEXT_UPSTREAM we never wrote is foreign state --
+        # chain must refuse rather than silently clobber it (and unchain --all would
+        # otherwise delete it later, compounding the damage).
+        user_settings = os.path.join(self.home, ".claude", "settings.json")
+        existing = "http://127.0.0.1:6000"
+        with open(user_settings, "w", encoding="utf-8") as f:
+            json.dump({"env": {"ROLLING_CONTEXT_UPSTREAM": existing}}, f)
+        self._displace()
+        before_user = open(user_settings, "rb").read()
+        before_local = open(self.local, "rb").read()
+        state_path = chain.state_path()
+        self.assertFalse(os.path.exists(state_path))
+
+        self.assertEqual(chain.do_chain(self.project, assume_yes=True), 2)
+
+        self.assertEqual(open(user_settings, "rb").read(), before_user)
+        self.assertEqual(open(self.local, "rb").read(), before_local)
+        self.assertFalse(os.path.exists(state_path))
+
+    def test_unknown_chain_flag_is_rejected_not_silently_ignored(self):
+        self.assertEqual(chain.main(["chain", "--yse"]), 1)
+
+    def test_unknown_unchain_flag_is_rejected_not_silently_ignored(self):
+        self.assertEqual(chain.main(["unchain", "--al"]), 1)
 
 
 if __name__ == "__main__":

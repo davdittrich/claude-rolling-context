@@ -137,12 +137,20 @@ def main(argv):
         return 0 if (rest and is_self(rest[0])) else 1
     cwd = os.getcwd()
     if verb == "chain":
+        unknown = [a for a in rest if a != "--yes"]
+        if unknown:
+            sys.stderr.write(f"unknown flag: {display(unknown[0])}\n")
+            return 1
         root = project_root(cwd)
         if root is None:
             print("no project here — run this inside a project directory")
             return 2
         return do_chain(root, assume_yes="--yes" in rest)
     if verb == "unchain":
+        unknown = [a for a in rest if a != "--all"]
+        if unknown:
+            sys.stderr.write(f"unknown flag: {display(unknown[0])}\n")
+            return 1
         return do_unchain(cwd, all_="--all" in rest)
     if verb == "status":
         return do_status(project_root(cwd) or cwd)
@@ -156,12 +164,8 @@ def main(argv):
         if value:
             print(value)
         return 0
-    sys.stderr.write(f"unknown verb: {verb}\n")
+    sys.stderr.write(f"unknown verb: {display(verb)}\n")
     return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
 
 
 def display(text):
@@ -288,6 +292,14 @@ def _guards(project, state):
                       f"{USER_KEY} is set in your shell environment "
                       f"({display(os.environ[USER_KEY])}) — settings can't override that. "
                       f"unset it or edit your shell config instead")
+    upstream_value, upstream_source = effective(USER_KEY, project)
+    if (upstream_value is not None and upstream_source != "<environment>"
+            and state.get("upstream") is None and upstream_value != value):
+        raise Refusal("upstream-already-set",
+                      f"{USER_KEY} is already set to {display(upstream_value)} in "
+                      f"{display(upstream_source)} and rolling-context did not put it there. "
+                      f"refusing to overwrite it — remove it yourself if you want "
+                      f"rolling-context to manage the upstream")
     host = urlparse(value).hostname
     if not host_matches(host, "127.0.0.1"):
         raise Refusal("non-loopback",
@@ -340,7 +352,7 @@ def do_chain(project, assume_yes=False):
         # Keyed by project: D10 allows two chained at once, and an unkeyed record would let
         # B's chain overwrite A's, after which A's unchain would restore B's displaced value
         # into B's file -- un-chaining a project the user never named.
-        state.setdefault("abu", {})[project] = {"path": source, "wrote": ours, "displaced": url}
+        state.setdefault("abu", {})[os.path.realpath(project)] = {"path": source, "wrote": ours, "displaced": url}
         state["upstream"] = {"wrote": url}
         save_state(state)
 
@@ -440,3 +452,7 @@ def do_status(project):
         print("compaction: OFF this session")
         print("fix: /rolling-context:chain")
     return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
