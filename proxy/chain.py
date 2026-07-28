@@ -129,9 +129,34 @@ def effective(key, project_root):
 
 
 def main(argv):
-    if len(argv) >= 2 and argv[0] == "is-self":
-        return 0 if is_self(argv[1]) else 1
-    sys.stderr.write("usage: chain.py is-self <url>\n")
+    if not argv:
+        sys.stderr.write("usage: chain.py {is-self <url>|chain [--yes]|unchain [--all]|status}\n")
+        return 1
+    verb, rest = argv[0], argv[1:]
+    if verb == "is-self":
+        return 0 if (rest and is_self(rest[0])) else 1
+    cwd = os.getcwd()
+    if verb == "chain":
+        root = project_root(cwd)
+        if root is None:
+            print("no project here — run this inside a project directory")
+            return 2
+        return do_chain(root, assume_yes="--yes" in rest)
+    if verb == "unchain":
+        return do_unchain(cwd, all_="--all" in rest)
+    if verb == "status":
+        return do_status(project_root(cwd) or cwd)
+    if verb == "effective-abu":
+        # What the hook calls. Prints the winning ANTHROPIC_BASE_URL and nothing else, so
+        # `$(chain.py effective-abu)` is directly usable in shell. Empty output means unset.
+        try:
+            value, _ = effective(ABU_KEY, project_root(cwd) or cwd)
+        except UnparseableSettings:
+            return 2
+        if value:
+            print(value)
+        return 0
+    sys.stderr.write(f"unknown verb: {verb}\n")
     return 1
 
 
@@ -191,3 +216,227 @@ def save_state(state):
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+
+
+USER_KEY = "ROLLING_CONTEXT_UPSTREAM"
+ABU_KEY = "ANTHROPIC_BASE_URL"
+
+
+class Refusal(Exception):
+    """A named guard refused. Nothing was written."""
+
+    def __init__(self, reason, message):
+        super().__init__(message)
+        self.reason = reason
+        self.message = message
+
+
+def project_root(start):
+    """Nearest ancestor containing .claude, stopping strictly before $HOME.
+
+    The exclusion is load-bearing: $HOME/.claude always exists, so a walk that did not stop before
+    it would treat the home directory as 'the project' and widen every unchain to --all's scope.
+    """
+    home = os.path.realpath(os.path.expanduser("~"))
+    here = os.path.realpath(start)
+    while here != os.path.dirname(here):
+        if here == home:
+            return None
+        if os.path.isdir(os.path.join(here, ".claude")):
+            return here
+        here = os.path.dirname(here)
+    return None
+
+
+def _write_key(path, key, value):
+    """Read, mutate in memory, write back whole. Never regenerate the file."""
+    data = read_settings(path)
+    env = data.setdefault("env", {})
+    if value is None:
+        env.pop(key, None)
+    else:
+        env[key] = value
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".rc-settings-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _read_key(path, key):
+    return (read_settings(path).get("env") or {}).get(key)
+
+
+def _guards(project, state):
+    """Every guard refuses with a named reason and writes nothing.
+
+    Displacement is checked FIRST: a user with a legitimate exported upstream and nothing
+    displacing them should hear "nothing to chain", not "unset your variable".
+    """
+    value, source = effective(ABU_KEY, project)
+    if value is None:
+        return None, None
+    if is_self(value):
+        return None, None
+    if os.environ.get(USER_KEY):
+        raise Refusal("upstream-pinned-by-env",
+                      f"{USER_KEY} is set in your shell environment "
+                      f"({display(os.environ[USER_KEY])}) — settings can't override that. "
+                      f"unset it or edit your shell config instead")
+    host = urlparse(value).hostname
+    if not host_matches(host, "127.0.0.1"):
+        raise Refusal("non-loopback",
+                      f"refusing to chain to {display(value)} — not a loopback address. "
+                      f"rolling-context only chains to local proxies "
+                      f"(127.0.0.1/::1/localhost); chaining elsewhere would forward your "
+                      f"API key off-machine")
+    if source == managed_settings_path():
+        raise Refusal("managed-scope",
+                      f"{display(value)} is set by managed-settings.json — an administrator "
+                      f"policy, not something rolling-context can override")
+    if urlparse(value).port == our_bind()[1]:
+        raise Refusal("same-port-different-host",
+                      f"{display(value)} uses our own port on a different host — refusing, "
+                      f"this looks like a misconfiguration rather than a proxy to chain to")
+    recorded = (state.get("upstream") or {}).get("wrote")
+    if recorded and recorded != value:
+        raise Refusal("divergent-chain",
+                      f"already chained to {display(recorded)}; {display(value)} is a different "
+                      f"proxy. run 'unchain' first if you want to switch")
+    return value, source
+
+
+def _confirm(url, assume_yes):
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        return False
+    print(f"chain will make {display(url)} the upstream for EVERY project on this machine,")
+    print(f"by writing {USER_KEY} to {user_settings_path()}.")
+    return input("continue? [y/N] ").strip().lower() == "y"
+
+
+def do_chain(project, assume_yes=False):
+    try:
+        state = load_state()
+        try:
+            url, source = _guards(project, state)
+        except Refusal as r:
+            print(f"not chained — {r.message}")
+            return 2
+        if url is None:
+            print("no foreign proxy detected — nothing to chain")
+            return 0
+        if not _confirm(url, assume_yes):
+            print("not chained — confirmation declined. re-run with --yes to skip the prompt")
+            return 2
+
+        ours = f"http://127.0.0.1:{our_bind()[1]}"
+        # Keyed by project: D10 allows two chained at once, and an unkeyed record would let
+        # B's chain overwrite A's, after which A's unchain would restore B's displaced value
+        # into B's file -- un-chaining a project the user never named.
+        state.setdefault("abu", {})[project] = {"path": source, "wrote": ours, "displaced": url}
+        state["upstream"] = {"wrote": url}
+        save_state(state)
+
+        # Upstream first: reversing this points Claude Code at us before we know where to
+        # forward, and "no upstream recorded" resolves to the default API -- silently
+        # un-chaining the user, which D9 forbids.
+        _write_key(user_settings_path(), USER_KEY, url)
+        _write_key(source, ABU_KEY, ours)
+
+        # Read back the EFFECTIVE value, not the file we just wrote. A managed policy -- which
+        # may arrive by plist, registry or drop-in, where no file check can see it -- leaves our
+        # write in place while the value that actually applies stays foreign. Resolving again is
+        # the only channel-agnostic way to know the write won.
+        landed, landed_source = effective(ABU_KEY, project)
+        if _read_key(user_settings_path(), USER_KEY) != url or not is_self(landed or ""):
+            _write_key(source, ABU_KEY, url)
+            _write_key(user_settings_path(), USER_KEY, None)
+            save_state(empty_state())
+            if landed and not is_self(landed):
+                print(f"not chained — {display(landed_source)} still supplies "
+                      f"{display(landed)}, which outranks what we wrote. changes undone")
+            else:
+                print("not chained — read-back failed, changes undone")
+            return 1
+        print(f"chained: {display(url)} is now upstream; rolling-context is back in the path")
+        return 0
+    except UnparseableSettings as e:
+        print(f"not chained — {display(e.path)} is not valid JSON — refusing to touch it. "
+              f"fix the file by hand and retry")
+        return 2
+
+
+def do_unchain(project, all_=False):
+    try:
+        state = load_state()
+        root = project if all_ else project_root(project)
+        if root is None and not all_:
+            print("nothing project-scoped to unchain here")
+            return 0
+
+        # Give back the key someone else owns -- this project's record and no other.
+        records = state.get("abu") or {}
+        targets = list(records) if all_ else ([root] if root in records else [])
+        for key in targets:
+            abu = records[key]
+            if _read_key(abu["path"], ABU_KEY) == abu["wrote"]:
+                _write_key(abu["path"], ABU_KEY, abu["displaced"])
+            else:
+                print(f"skipped {display(abu['path'])} — {ABU_KEY} is no longer ours")
+            del records[key]
+        state["abu"] = records
+
+        # Our own key is left set. Restoring ANTHROPIC_BASE_URL above already took this
+        # project out of the request path, so the upstream value is inert for it -- and
+        # another project may still be chained through it (D10). Only --all removes it,
+        # which is what uninstall passes and means "nothing is chained any more".
+        upstream = state.get("upstream")
+        if upstream and all_:
+            if _read_key(user_settings_path(), USER_KEY) == upstream["wrote"]:
+                _write_key(user_settings_path(), USER_KEY, None)
+            else:
+                print(f"skipped {USER_KEY} — it is no longer ours")
+            state["upstream"] = None
+        save_state(state)
+        print("unchained")
+        return 0
+    except UnparseableSettings as e:
+        print(f"not unchained — {display(e.path)} is not valid JSON — refusing to touch it")
+        return 2
+
+
+def do_status(project):
+    """Reports. Never writes -- a command run anytime must not mutate state."""
+    port = our_bind()[1]
+    print(f"rolling-context: port {port}")
+    try:
+        value, source = effective(ABU_KEY, project)
+        state = load_state()
+    except UnparseableSettings as e:
+        print(f"cannot report — {display(e.path)} is not valid JSON")
+        return 2
+
+    if value is None:
+        print("in path:  no  -- ANTHROPIC_BASE_URL is unset")
+    elif is_self(value):
+        print(f"in path:  yes -- from {display(source)}")
+    else:
+        print(f"in path:  no  -- {display(value)} wins, from {display(source)}")
+
+    upstream = state.get("upstream")
+    if upstream:
+        print(f"chained:  yes -- upstream {display(upstream['wrote'])}")
+    else:
+        print("chained:  no")
+
+    if value is not None and not is_self(value):
+        print("compaction: OFF this session")
+        print("fix: /rolling-context:chain")
+    return 0
