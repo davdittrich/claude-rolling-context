@@ -92,7 +92,7 @@ found it. Where to write is not a free choice.
 | D14 | Before the `~/.claude/settings.json` write — the scope-escalation step, since it becomes upstream for every project on the machine — `chain` prints the destination and an explicit statement that all API traffic, machine-wide, will route through it, and requires confirmation: interactive `y/N`, or `--yes` for scripted use. Still one command (R2): confirmation is a step inside running it, not a second command. |
 | D15 | The per-request upstream accessor returns a small parsed struct (`scheme`, `host`, `port`, `path`), not a plain string. A string accessor only fixes the literal `UPSTREAM_URL` sites; it misses `_parsed_upstream`, `UPSTREAM_PATH`, and the connection factory (`server.py:123-124,151-161`), which is why a naive fix would not actually kill the frozen-upstream bug. |
 | D16 | Loop protection beyond `is-self`: every chained forward carries `X-Rolling-Context-Chained-From: <our own scheme>://<our own host>:<our own port>`. An inbound request already carrying that header naming this daemon's own address is refused as a loop rather than forwarded — `is-self` alone only catches a direct self-chain, not a longer cycle through an intermediate proxy. The header is compared with the same `host_matches`/`port_matches` normalization `is-self` uses (§6), never as a raw string: an intermediate proxy that relays `localhost` where we bind `127.0.0.1` would otherwise walk straight through the check. The emitted value always uses the loopback form regardless of the actual bind host. |
-| D17 | `ROLLING_CONTEXT_UPSTREAM` lives in one shared file while `writes` records it per project, so a `(path, key)` tuple no longer identifies one write. `writes` is append-per-project, the reference count is derived from the list itself, and only the last remaining reference restores — using the earliest recorded `displaced`. Without it, plain `unchain` in one project silently un-chains every other project chained to the same proxy, with no alert firing. See §5. |
+| D17 | `ROLLING_CONTEXT_UPSTREAM` lives in one file shared by every chained project, so it is not a `writes` entry at all: it gets its own `shared_upstream` object holding the pre-rolling-context `original` (captured once, never rewritten) and `refs`, the list of projects currently chained through it. The last project to leave restores `original`, under the usual read-back guard. Without this, plain `unchain` in one project silently un-chains every other project chained to the same proxy, with no alert firing — and any scheme that derives the original from per-project records fails outright when projects unchain out of order, because the record holding the original is destroyed first. See §5. |
 | D18 | §7 enforces D13's loopback rule at resolution time as well, for the file-sourced tiers (2 and 3) only. `chain` is not the only thing that can put a value in `~/.claude/settings.json` — a hand-edit or a future writer bypasses its guards entirely, and §7 then forwards full headers including the API key (`server.py:437-443`) wherever that value points. Tier 1 — `ROLLING_CONTEXT_UPSTREAM` exported in the process environment — is exempt: that is a deliberate per-invocation act by the user, not a persistent file another tool can rewrite behind their back, and restricting it would break anyone deliberately pointing at a remote gateway. A refused file-sourced value produces the §7 dead-upstream error shape naming the reason, not a silent fallback. |
 
 Carried from earlier: **D3** — `pwsh` is absent on this machine, so all `.ps1`
@@ -119,8 +119,10 @@ uninstall restoration of state we never recorded.
 **Provenance.** D1–D12 come from the brainstorming session with the user. D13–D15
 are user decisions taken during design-review-gate iteration 1 (loopback scope,
 scope-escalation confirmation, accessor shape); D16–D17 answer blockers raised by
-the Security and Architect reviewers in iterations 1 and 2 respectively; D18
-answers the Security reviewer's iteration-2 question, decided by the user.
+the Security and Architect reviewers in iterations 1 and 2 respectively, D17 in
+the `shared_upstream` form after the Architect showed in iteration 3 that its
+first draft was order-dependent; D18 answers the Security reviewer's iteration-2
+question, decided by the user.
 
 ## 4. Mechanism
 
@@ -169,68 +171,91 @@ links the plugin at `$HOME/.claude/plugins/rolling-context`.
   "writes": [
     {
       "project": "/home/dd/proj/A",
-      "path": "/home/dd/.claude/settings.json",
-      "key": "ROLLING_CONTEXT_UPSTREAM",
-      "wrote": "http://127.0.0.1:8787",
-      "displaced": null
-    },
-    {
-      "project": "/home/dd/proj/A",
       "path": "/home/dd/proj/A/.claude/settings.local.json",
       "key": "ANTHROPIC_BASE_URL",
       "wrote": "http://127.0.0.1:5588",
       "displaced": "http://127.0.0.1:8787"
     }
   ],
+  "shared_upstream": {
+    "path": "/home/dd/.claude/settings.json",
+    "key": "ROLLING_CONTEXT_UPSTREAM",
+    "wrote": "http://127.0.0.1:8787",
+    "original": null,
+    "refs": ["/home/dd/proj/A"]
+  },
   "alerted": [{"project": "/home/dd/proj/A", "url": "http://127.0.0.1:8787"}]
 }
 ```
 
-Two fields:
+Three fields:
 
-- **`writes`** — one entry per key we set, in the order we set it. `wrote` powers
-  the read-back guard; `displaced` powers strict undo (D7). `"displaced": null`
-  means the key was absent before us, so undo deletes it. `unchain` walks the list
-  in reverse. Each entry also carries the `project` whose `chain` call created it,
-  which is what makes the shared-key rule below expressible.
-
-### The shared key, and why `writes` is append-only per project (D17)
-
-`ANTHROPIC_BASE_URL` is written per project. `ROLLING_CONTEXT_UPSTREAM` is not:
-it lives in one file, `~/.claude/settings.json`, shared by every chained project.
-D10 permits projects A and B to chain concurrently to the same URL, so both
-record a `writes` entry naming the identical `(path, key)` tuple. Nothing about
-that is redundant — each entry records that one more project depends on the key
-being set — but it means a `(path, key)` tuple no longer identifies one write.
-
-Two rules follow, and `unchain` (§6) depends on both:
-
-- **Append, don't dedupe.** Project B's `chain` records its own entry even when
-  the key already holds exactly the value B would write. B's `wrote` is that
-  value and B's `displaced` is what B found — which is A's value, i.e. our own.
-  Skipping the record because "the key is already right" would lose the fact that
-  B now depends on it.
-- **The last reference restores; the others just drop their entry.** The
-  reference count is *derived* from `writes` — the number of entries for that
-  `(path, key)` tuple — not stored in a separate counter that could disagree with
-  the list it describes. When more than one remains, `unchain` removes only its
-  own project's entry and leaves the key alone. When its entry is the last one,
-  it restores using the **earliest** recorded `displaced` for that tuple — the
-  value that predates rolling-context entirely. Restoring B's `displaced` would
-  write our own chained value back as though a user had configured it, leaving
-  the machine chained after the last project unchained.
-
-Without this, plain `unchain` in A deletes or rewrites the key out from under B.
-B's `ANTHROPIC_BASE_URL` still points at us, so §8's displacement check stays
-quiet; B's own recorded value was never touched, so §8's drift check stays quiet
-too; and B's traffic silently falls from §7's tier 2 through to tier 3 or 4. That
-is the exact silent-corruption class §3's Governing Rule and D7 exist to prevent.
+- **`writes`** — one entry per **project-scoped** key we set, in the order we set
+  it. `wrote` powers the read-back guard; `displaced` powers strict undo (D7).
+  `"displaced": null` means the key was absent before us, so undo deletes it.
+  `unchain` walks the list in reverse. In practice this is `ANTHROPIC_BASE_URL`
+  in a project's own settings file, and `project` records whose `chain` call
+  created it.
+- **`shared_upstream`** — the one machine-wide key, held separately. See below.
 - **`alerted`** — `{project, url}` pairs already announced (D8). Keyed on project,
   not just URL: `headroom wrap claude` binds the same port every time, so a
   URL-only key alerts the user exactly once in the lifetime of the install and
   goes silent in every project after the first — reproducing the defect this
   design exists to fix, one field over. A pair is "alerted" only once its own
   `{project, url}` tuple has been recorded.
+
+### The shared key is not a `writes` entry (D17)
+
+`ANTHROPIC_BASE_URL` is written per project. `ROLLING_CONTEXT_UPSTREAM` is not:
+it lives in one file, `~/.claude/settings.json`, shared by every chained project.
+D10 permits projects A and B to chain concurrently to the same URL, so if this key
+were recorded in `writes` two entries would name the identical `(path, key)`
+tuple, and the tuple would no longer identify one write. It is therefore held in
+its own object, not in `writes` at all:
+
+```json
+"shared_upstream": {
+  "path": "/home/dd/.claude/settings.json",
+  "key": "ROLLING_CONTEXT_UPSTREAM",
+  "wrote": "http://127.0.0.1:8787",
+  "original": null,
+  "refs": ["/home/dd/proj/A", "/home/dd/proj/B"]
+}
+```
+
+- **`original` is captured once and never rewritten.** It is whatever the key held
+  the first time any project chained — the value that predates rolling-context
+  entirely, `null` if the key was absent. When a second project chains, `original`
+  is left exactly as it is; what B "displaced" is our own value, which is not a
+  thing anyone should ever be restored to.
+- **`refs` is the reference count, as a list of projects rather than a number.**
+  `chain` appends the project, `unchain` removes it. A list cannot drift out of
+  agreement with itself the way a count maintained beside a separate list can, and
+  it also answers *which* projects are still chained, which the `unchain` message
+  and `status` both need.
+- **Restore happens when `refs` empties, and only then**, back to `original`,
+  under the same read-back guard as every other write: if the live value no longer
+  equals `wrote`, skip and report rather than overwrite. §8's drift case is
+  precisely a live value changing underneath us, so the last unchain must not
+  assume it still owns the key.
+
+This ordering-independence is the whole point. An earlier draft of D17 kept the
+key in `writes`, one entry per project, and had the last remaining entry restore
+the *earliest* recorded `displaced`. That is correct only if projects unchain in
+the reverse of the order they chained. Take A chaining over a pre-existing `X0`,
+then B chaining to the same URL, then **A unchaining first**: A is not the last
+reference, so its entry — the only record of `X0` — is dropped, and when B later
+unchains as the last reference the earliest `displaced` still present is B's own,
+which is our chained value. The machine is left chained to the foreign proxy after
+the last project unchained. Deriving the original from records that are destroyed
+on the way out cannot work; the original has to be stored once, outside them.
+
+Without any of this, plain `unchain` in A deletes or rewrites the key out from
+under B. B's `ANTHROPIC_BASE_URL` still points at us, so §8's displacement check
+stays quiet; B's own recorded value was never touched, so §8's drift check stays
+quiet too; and B's traffic silently falls from §7's tier 2 through to tier 3 or 4.
+That is the exact silent-corruption class §3's Governing Rule and D7 exist to
+prevent.
 
 **No `upstream` field** (D12) — the chained upstream is `ROLLING_CONTEXT_UPSTREAM`
 in `~/.claude/settings.json`, which is also the value the daemon and
@@ -291,7 +316,11 @@ call time (never a hardcoded `127.0.0.1:5588`), so a non-default
 `127.0.0.1`, `::1`, and `localhost` as equivalent; a bare host with no port uses
 the scheme's default (80/443) before comparing. `same-port-different-host` (below)
 is the guard for the case this predicate correctly does **not** catch: a foreign
-proxy on our port but a different host is not us, and chaining to it is legal.
+proxy on our port but a different host is genuinely not us, so `is-self` must
+return false — and the separate guard then refuses to chain to it, because a
+foreign proxy squatting our own port on another host is far more likely a
+misconfiguration than a deliberate topology. `is-self` classifies; the guard
+decides. They are not the same question, and only the guard is about legality.
 
 ### `chain`
 
@@ -334,7 +363,10 @@ just the final write — see §5 Writing rules):
    anything else: `chain` is about to make `<url>` upstream for every project on
    this machine, via `~/.claude/settings.json`. Requires `y`, or `--yes` to skip
    the prompt; anything else refuses via the `declined` guard above.
-2. Record both intended `writes` entries in the state file.
+2. Record the intended `ANTHROPIC_BASE_URL` write in `writes`, and record this
+   project in `shared_upstream.refs` — capturing `original` from the key's current
+   value if and only if `refs` was empty, so the first chain on the machine is the
+   one that snapshots what predates us (D17, §5).
 3. Write `ROLLING_CONTEXT_UPSTREAM` = the foreign URL to `~/.claude/settings.json`.
 4. Write `ANTHROPIC_BASE_URL` = `http://127.0.0.1:$ROLLING_CONTEXT_PORT` to the
    file that displaced us.
@@ -363,14 +395,24 @@ equals our `wrote`, restore `displaced` byte-exact, or delete the key when
 the user edited it — skip, report, and leave the file alone. Drop the entry either
 way.
 
-**The shared upstream key is the exception** (D17, §5). Before touching
-`(~/.claude/settings.json, ROLLING_CONTEXT_UPSTREAM)`, count the remaining
-`writes` entries for that tuple. If entries from other projects remain, drop only
-this project's entry and leave the key set — those projects are still chained
-through it. If this is the last entry, restore the **earliest** recorded
-`displaced` for the tuple rather than this entry's own, which is only ever our own
-value written back by a later project's `chain`. `--all` removes every entry, so
-the count reaches zero in one pass and the earliest `displaced` is restored once.
+**The shared upstream key is handled separately** (D17, §5), because it is not in
+`writes`. Remove this project from `shared_upstream.refs`, then:
+
+- **`refs` still non-empty** — leave the key exactly as it is; those projects are
+  still chained through it. Say so rather than exiting silently, since the user
+  just ran a command whose name promises removal:
+  `left ROLLING_CONTEXT_UPSTREAM set — still chained by: <project>[, <project>…]`.
+- **`refs` now empty** — restore `original` byte-exact, or delete the key when
+  `original` is null. **Read back first**, exactly as for every entry in `writes`:
+  if the live value no longer equals `shared_upstream.wrote`, something else
+  changed it — §8's drift case is precisely this — so skip, report, and leave the
+  file alone. The last unchain does not get to assume it still owns the key.
+
+`--all` empties `refs` in a single pass, so it takes the restore branch once, with
+the same read-back. It is the same branch and the same guard as the sequential
+case, not a separate path with different safety properties — which is only true
+because `original` lives outside the per-project records and cannot be destroyed
+by whichever project happens to leave first.
 
 This guard is also what prevents resurrecting a dead port: headroom deletes that
 key when it exits (`wrap.py:1779-1781`), removing our value first, so `unchain`
@@ -494,8 +536,19 @@ model reads.
 
 The message names the **shell** form, not the slash command: the model cannot
 answer while its own requests are failing, so the escape hatch must not require a
-model round-trip. When the upstream came from tier 1, the message names the
-environment variable instead. HTTP statuses returned by a live upstream pass
+model round-trip. `unchain` is the wrong advice when the upstream came from tier
+1, though — the variable is in the user's shell and no file write can override it
+— so that case substitutes its own message, again literal:
+
+```json
+{"type":"error","error":{"type":"api_error","message":
+ "rolling-context: chained upstream http://127.0.0.1:8787 is not answering. It comes from ROLLING_CONTEXT_UPSTREAM in this session's environment, so unchain cannot clear it — unset ROLLING_CONTEXT_UPSTREAM in your shell and restart the proxy."}}
+```
+
+The D18 refusal reuses the same shape with the reason and the offending file
+named: `rolling-context: refusing to use chained upstream https://proxy.example.com
+from /home/dd/.claude/settings.json — it is not a loopback address, and forwarding
+there would send your API key off-machine. Fix or remove that value.` HTTP statuses returned by a live upstream pass
 through untouched; only failures to reach it produce this.
 
 **Two consumers that must follow the upstream or fail silently:**
@@ -554,9 +607,17 @@ would be silently suppressed by project A's earlier alert.
 | foreign URL in `alerted` for this project, no write recorded for that file | no |
 | foreign URL in `alerted` for this project, **a write is recorded for that file** | **yes** — our chain was displaced |
 
-The third row uses different wording ("your chain was overwritten") and does not
-depend on which tool did it. Silence there would recreate the original bug in a new
-place.
+The third row does not depend on which tool did it, and gets its own text — this
+user already chained deliberately, so "another proxy holds the variable" would
+understate what happened:
+
+```json
+{"hookSpecificOutput":{"hookEventName":"SessionStart",
+  "additionalContext":"rolling-context was chained through http://127.0.0.1:8787 in this project, but something has since overwritten ANTHROPIC_BASE_URL and rolling-context is out of the request path again; context compaction is not running. Re-running /rolling-context:chain restores it."},
+ "systemMessage":"[rolling-context] your chain was overwritten — compaction is OFF this session. http://127.0.0.1:8787 holds ANTHROPIC_BASE_URL again.\n  fix: /rolling-context:chain     check anytime: /rolling-context:status"}
+```
+
+Silence there would recreate the original bug in a new place.
 
 There is no "everything is fine" line. Silence plus `status` is the contract.
 
@@ -572,8 +633,7 @@ point of view nothing changed — we are still in the request path — but we ar
 silently chaining somewhere the user did not choose, or silently un-chained.
 
 Detected the same way as displacement: `SessionStart` compares the live
-`ROLLING_CONTEXT_UPSTREAM` value against what `chain`'s write recorded (§5) for
-this project. Mismatch fires the same two-field contract:
+`ROLLING_CONTEXT_UPSTREAM` value against `shared_upstream.wrote` (§5). Mismatch fires the same two-field contract:
 
 ```json
 {"hookSpecificOutput":{"hookEventName":"SessionStart",
@@ -653,17 +713,18 @@ because no test covered state-file version handling at all.
 
 | Test file | What must fail first |
 |---|---|
-| `test_is_self.py` | the single predicate across all four semantics the seven sites had, including `:8787`-is-not-us |
+| `test_is_self.py` | the single predicate across all four semantics the seven sites had, including `:8787`-is-not-us; a non-default `ROLLING_CONTEXT_PORT` still self-detects, since the predicate reads the live bind address rather than a hardcoded `5588`; same-port-different-host is **not** self (the guard, not the predicate, refuses it) |
 | `test_effective_value.py` | Fact 3 precedence, and that the source *file* is reported |
 | `test_chain_verb.py` | each refusal reason including `declined` and `non-loopback`; the two exit-0 no-ops; upstream-before-base-URL order; reverse undo when read-back fails; the D10 matching-URL success path — a second project chaining to the already-recorded URL writes successfully and appends its own entry |
 | `test_chain_confirm.py` | the D14 gate: a declined answer writes nothing and exits 2; `--yes` bypasses the prompt; non-interactive stdin without `--yes` refuses rather than hanging; the notice names both the destination and the machine-wide scope |
-| `test_unchain_verb.py` | restore vs delete on `displaced: null`; skip when our value is gone; reverse order; project-root scoping; `--all` |
-| `test_unchain_shared_key.py` | D17: with two projects' entries present, project A's `unchain` drops only its own entry and leaves `ROLLING_CONTEXT_UPSTREAM` set, so project B still resolves at tier 2; the last remaining entry restores the **earliest** recorded `displaced`, not its own; `--all` reaches zero references in one pass |
+| `test_unchain_verb.py` | restore vs delete on `displaced: null`; skip when our value is gone; reverse order; project-root scoping, explicitly including the no-ancestor-before-`$HOME` case that must report and exit 0 rather than treating `$HOME/.claude` as the project; `--all` |
+| `test_unchain_shared_key.py` | D17: with A and B both in `shared_upstream.refs`, A's `unchain` removes only A and leaves the key set, so B still resolves at tier 2, and the message names B as still chained; the last project out restores `original`; **out-of-order unchain** (A chains over a pre-existing value, B chains to the same URL, A unchains first, then B) still restores that pre-existing value, which is the case the previous derive-from-`writes` design got wrong; a drifted live value fails the read-back and is left alone rather than overwritten; `--all` empties `refs` in one pass and takes the same guarded restore branch |
 | `test_loop_protection.py` | D16: a request carrying our own address in `X-Rolling-Context-Chained-From` is refused as a loop; a genuinely different chained-from address forwards normally; an alternate loopback spelling (`localhost` vs `127.0.0.1`) is still caught; the emitted value tracks the live bind address rather than a constant |
-| `test_state_io.py` | atomic replace; refusal on unparseable state; flock under contention; the file is created mode `0600`, on both the create and the `os.replace` rewrite path |
+| `test_state_io.py` | atomic replace; refusal on unparseable state; flock under contention; the file is created mode `0600`, on both the create and the `os.replace` rewrite path; a chained URL written to the state file is re-serialized from the parsed `Upstream`, never the raw string |
 | `test_server_upstream.py` | all four tiers, each `is_self`-guarded; cache invalidation on `mtime_ns` change; D18 — a non-loopback value at tier 2 or 3 is refused and names the offending file, while the same value at tier 1 is honoured |
+| `test_upstream_reaches_socket.py` | the actual frozen-upstream defect: with the daemon running and **not** restarted, change the settings upstream between two requests and assert the second request arrives at the *second* in-process listener. Unmocked sockets — this is the one test that fails if resolution is merely re-parsed and cached without reaching the connection factory (`server.py:151-161`) and the derived sites (`:634`, `:767`, `:865`, `:869`, `:1065`). Every other row in this table passes against a naive string-only fix; this is what `Gemini-b9b.6` actually promises |
 | `test_response_header_logging.py` | response-side header logging at `server.py:642` and `:877` is name-only at DEBUG, matching the request-side filter at `:446`/`:794`; a chained upstream's header *values* never reach the log |
-| `test_dead_upstream.py` | connection refused → Anthropic-shaped body; per-tier wording; the resolved path is the server's own; live upstream statuses pass through |
+| `test_dead_upstream.py` | connection refused → Anthropic-shaped body; per-tier wording, both variants literal (the `unchain` form for file-sourced, the unset-the-variable form for tier 1); the D18 refusal names the offending file; the resolved path is the server's own; the URL in every one of these bodies is re-serialized from the parsed `Upstream`, never interpolated raw; live upstream statuses pass through |
 | `test_summarizer_follows.py` | the summarizer tracks a changed upstream; the explicit override still wins |
 | `test_hook_output.py` | stdout is exactly one JSON object or empty; `systemMessage` present when displaced; the three-row suppression matrix keyed per `{project, url}` — including two projects, same displacing URL, both alerted; diagnostics never on stdout |
 | `test_upstream_drift.py` | live `ROLLING_CONTEXT_UPSTREAM` differing from the recorded value fires the drift alert while `ANTHROPIC_BASE_URL` still points at us; the key going missing fires it; a second, different drift after the first is not suppressed |
@@ -708,7 +769,8 @@ Tests importing `_fakes` run via `python3 -m unittest discover -s tests`.
 | Patch `headroom wrap`, or use `ANTHROPIC_TARGET_API_URL` to put headroom outside | out of scope (R5) |
 | Launcher script or documented config workaround | not a shipped feature (R5) |
 | Loopback enforcement at all four resolution tiers, including the process environment | tier 1 is the user exporting a variable in their own shell — a deliberate act, not a file another tool can rewrite behind their back. Refusing it would break a remote-gateway setup with no opt-in left, so the enforcement stops at the file-sourced tiers (D18) |
-| Storing an explicit reference count for the shared upstream key | a counter can disagree with the `writes` list it describes; the count is derivable from the list, so deriving it removes the failure mode instead of guarding it (D17) |
+| A numeric reference count for the shared upstream key | a bare integer maintained beside the records it counts can disagree with them, and it cannot answer *which* projects are still chained — which both the `unchain` message and `status` need. `shared_upstream.refs` is a list of projects, which is the count and the answer at once (D17) |
+| Keeping the shared upstream key in `writes`, one entry per project, restoring the earliest recorded `displaced` | this was the first D17 draft and it is order-dependent: the entry holding the pre-rolling-context value is dropped when that project unchains, so if it leaves first the last project out restores our own chained value and the machine stays chained. The original has to live outside the per-project records, because those are destroyed on the way out (§5) |
 | A `--home` CLI flag for test convenience | production surface added for tests; tests set and restore `HOME` |
 
 ## 12. Open items
@@ -722,7 +784,9 @@ our code it is true by construction — but the claim that matters is the one ab
 *Claude Code's* behaviour when both are present, and no probe in §2 measured it.
 Fact 3 measured project-`settings.local.json` versus inherited process env for
 `ANTHROPIC_BASE_URL`, which is a different pair of sources and a different key.
-Before implementing the `upstream-pinned-by-env` guard (§6), run a probe in the
+This probe is the **first** implementation task, not a later one: the
+`upstream-pinned-by-env` guard (§6), its refusal message, and the tier order all
+depend on the outcome. Before implementing that guard, run a probe in the
 style of the Fact 1/Fact 3 spikes — set both, observe which one a live session
 actually uses — and record the result here as a measured fact. If the measurement
 contradicts the assumption, the guard's refusal message and the tier order both
