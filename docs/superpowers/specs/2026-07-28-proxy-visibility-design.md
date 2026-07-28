@@ -116,7 +116,10 @@ de-chaining; retention rules; the `chains` map; first-write-wins arbitration;
 `ROLLING_CONTEXT_AUTOCHAIN`; per-project concurrent upstreams; byte-exact
 uninstall restoration of state we never recorded.
 
-**Provenance.** D1–D12 come from the brainstorming session with the user. D13–D15
+**Provenance.** D1–D12 come from the brainstorming session with the user on 2026-07-27/28,
+transcribed in Claude Code session `7de326fc-1f20-4d28-9f96-7d7a71f8a1a3`; the three governing
+statements are quoted verbatim in a `bd comment` on epic `Gemini-b9b`, since "the user said so
+earlier" is not a citation. D13–D15
 are user decisions taken during design-review-gate iteration 1 (loopback scope,
 scope-escalation confirmation, accessor shape); D16–D17 answer blockers raised by
 the Security and Architect reviewers in iterations 1 and 2 respectively, D17 later collapsed to
@@ -743,6 +746,7 @@ Tests importing `_fakes` run via `python3 -m unittest discover -s tests`.
 | Pruning `refs` entries for deleted projects, with liveness checks and `realpath` canonicalization | a stale entry is cleared by `unchain` from any other project or by deleting the state file, and `status` names it. Automating that meant a liveness rule, a canonicalization rule, and a rule about which verbs may write — a subsystem for a case never observed |
 | Refusing an unknown state-file `version` | version 1 is the only version that exists. Add the check with the second version, when there is something to distinguish |
 | Requiring `chain`'s write target to resolve inside the project root | defends against a repo shipping `.claude` as a symlink — an adversarial layout on the user's own machine, with no requirement and no incident behind it |
+| `chain` only: no state file, no `unchain`, no `status` — print the displaced value and let the user restore it by hand | satisfies R1, R2 and R3 literally, and is materially smaller: it deletes the state file, the lock, both undo paths and the reference list. Rejected on a data-loss axis rather than a size one. `chain` overwrites `ANTHROPIC_BASE_URL` in a file the user owns; without a record, a value the user set deliberately before headroom ever ran is gone the moment they accept the fix, recoverable only if they noticed the printed line and kept it. D7 exists for exactly that. It also gives up D10: a second project chaining through the same proxy would blindly rewrite with no record of who else depends on the key, which is harmless when the URL matches and silently wrong when it diverges — the case D10 refuses outright. R6 invites cutting toward manual recovery, and this is the cut it invites; it is declined because "simpler" here means "loses the user's data quietly", not "does less work" |
 | A `--home` CLI flag for test convenience | production surface added for tests; tests set and restore `HOME` |
 
 ## 12. Open items
