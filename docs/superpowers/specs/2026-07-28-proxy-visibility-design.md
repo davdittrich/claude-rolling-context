@@ -212,6 +212,15 @@ Three fields, and the asymmetry between the first two is the whole design:
   reads its own project's entry and no other.
 - **`upstream`** — `ROLLING_CONTEXT_UPSTREAM` in `~/.claude/settings.json`. **Ours.**
   Nothing else writes it, so there is no displaced value and none is recorded.
+
+  "Nothing else writes it" is an assumption a user can falsify by hand-editing their own
+  settings. When they have, `chain` **refuses** (`upstream-already-set`, §6) rather than
+  recording what it displaced. Recording would mean giving this key a `displaced` field, and
+  that field is what produced the ordering bug, the repair for the ordering bug, and the
+  reference counting that repaired the repair — three review rounds, all to restore a value
+  to a key that in every other circumstance nobody but us writes. Refusing keeps the
+  asymmetry intact and matches the governing rule: we never displace a foreign value unless
+  the user asks.
   `wrote` exists only so the read-back guard and §8's drift check can tell our
   value from someone else's.
 - **`alerted`** — `{project, url}` pairs already announced (D8), keyed per project.
@@ -321,6 +330,7 @@ and writes nothing; the two no-ops exit 0.
 | `divergent-chain` | `ROLLING_CONTEXT_UPSTREAM` in `~/.claude/settings.json` is set to a different URL (D10) | 2 | `already chained to <existing>; <url> is a different proxy. run 'unchain' first if you want to switch` |
 | `upstream-pinned-by-env` | `ROLLING_CONTEXT_UPSTREAM` is set in the process environment | 2 | `ROLLING_CONTEXT_UPSTREAM is set in your shell environment (<value>) — settings can't override that. unset it or edit your shell config instead` |
 | `unparseable-settings` | a target settings file or the state file is invalid JSON | 2 | `<path> is not valid JSON — refusing to touch it. fix the file by hand and retry` |
+| `upstream-already-set` | `ROLLING_CONTEXT_UPSTREAM` is present in a settings file, we have no record of writing it, and its value differs from what we would write | 2 | `ROLLING_CONTEXT_UPSTREAM is already set to <existing> in <source> and rolling-context did not put it there. refusing to overwrite it — remove it yourself if you want rolling-context to manage the upstream` |
 | `declined` | the D14 scope-escalation confirmation was answered anything but `y`, or stdin is not a TTY and `--yes` was not passed | 2 | `not chained — confirmation declined. re-run with --yes to skip the prompt` |
 
 `declined` is a guard like any other: nothing is written, the state file is
