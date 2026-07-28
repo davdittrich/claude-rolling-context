@@ -456,6 +456,24 @@ class EffectiveValueTest(unittest.TestCase):
             chain.effective(KEY, self.project)
         self.assertEqual(ctx.exception.path, path)
 
+    def test_environment_supplies_the_value_when_no_file_does(self):
+        # The weakest scope still wins when nothing else sets the key. Without this test
+        # the entire env-fallback branch is never executed by the suite.
+        with mock.patch.dict(os.environ, {KEY: "http://127.0.0.1:3333"}):
+            value, source = chain.effective(KEY, self.project)
+        self.assertEqual(value, "http://127.0.0.1:3333")
+        self.assertEqual(source, "<environment>")
+
+    def test_a_file_beats_the_environment(self):
+        # The regression test for precedence inversion. An earlier draft of this design had
+        # the environment checked first; this is what would have caught it.
+        local = os.path.join(self.project, ".claude", "settings.local.json")
+        self._write(local, "http://127.0.0.1:2222")
+        with mock.patch.dict(os.environ, {KEY: "http://127.0.0.1:3333"}):
+            value, source = chain.effective(KEY, self.project)
+        self.assertEqual(value, "http://127.0.0.1:2222")
+        self.assertEqual(source, local)
+
     def test_missing_env_block_is_not_an_error(self):
         path = os.path.join(self.home, ".claude", "settings.json")
         with open(path, "w", encoding="utf-8") as f:
@@ -553,7 +571,7 @@ def effective(key, project_root):
 - [ ] **Step 4: Run and verify it passes**
 
   Run: `python3 -m unittest tests.test_effective_value -v`
-  Expected: PASS, 6 tests.
+  Expected: PASS, 8 tests.
 
 - [ ] **Step 5: Commit**
 
