@@ -7,6 +7,11 @@ PROXY_DIR="$SCRIPT_DIR/../proxy"
 PIDFILE="$HOME/.claude/rolling-context-proxy.pid"
 VERFILE="$HOME/.claude/rolling-context-proxy.version"
 HOOKLOG="$HOME/.claude/rolling-context-hook.log"
+# Every diagnostic below redirects to $HOOKLOG. A missing or unwritable ~/.claude made
+# those redirections fail, which failed the command they were attached to -- the alert
+# turned into silence. A log sink must never be able to suppress the thing it logs.
+mkdir -p "$HOME/.claude" 2>/dev/null
+: 2>/dev/null >>"$HOOKLOG" || HOOKLOG=/dev/null  # stderr first: a failing redirect reports on the fd it already has
 PORT="${ROLLING_CONTEXT_PORT:-5588}"
 PROXY_URL="http://127.0.0.1:$PORT"
 CURRENT_VERSION=$(cat "$SCRIPT_DIR/../.claude-plugin/plugin.json" 2>/dev/null | grep '"version"' | head -1 | sed 's/.*"version".*"\(.*\)".*/\1/')

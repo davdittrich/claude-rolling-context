@@ -66,6 +66,18 @@ class InstallSeedingTest(unittest.TestCase):
         self._run()
         self.assertNotIn("ROLLING_CONTEXT_UPSTREAM", self._user_env())
 
+    def test_unparseable_settings_are_skipped_not_overwritten(self):
+        # Failure mode is data loss: the pre-guard code fell back to `settings = {}` and
+        # rewrote the whole file, destroying settings that were one typo from recoverable.
+        path = os.path.join(self.home, ".claude", "settings.json")
+        corrupt = '{"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",}'
+        with open(path, "w") as f:
+            f.write(corrupt)
+        result = self._run()
+        with open(path) as f:
+            self.assertEqual(f.read(), corrupt)
+        self.assertIn("SKIPPED", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -139,6 +139,49 @@ class HookOutputTest(unittest.TestCase):
         self._displace()
         self.assertIn("overwritten", self._run().stdout)
 
+    def test_a_reclaimed_chain_is_reported_in_every_session(self):
+        # The repeat path. The test above only reaches the first-sight branch, because the
+        # {project, url} pair is new; from the second session on, `if ours` is the only thing
+        # still speaking. Silence there means told once and silently degraded forever.
+        self._displace()
+        self.assertEqual(self._chain().returncode, 0)
+        self._displace()
+        self.assertIn("overwritten", self._run().stdout)
+        self.assertIn("overwritten", self._run().stdout)
+
+    def test_a_foreign_value_in_the_user_file_is_left_byte_for_byte(self):
+        # D7 at user scope. Every other displacement test puts the foreign value in the
+        # project file, so nothing held the foreign branch to `seed` rather than `seed write`
+        # -- the scope where a `write` would actually clobber somebody.
+        path = os.path.join(self.home, ".claude", "settings.json")
+        seeded = json.dumps({"env": {
+            "ANTHROPIC_BASE_URL": FOREIGN,
+            "ROLLING_CONTEXT_PORT": "5588",
+            "ROLLING_CONTEXT_TRIGGER": "100000",
+            "ROLLING_CONTEXT_TARGET": "40000",
+        }}, indent=2) + "\n"
+        with open(path, "w") as f:
+            f.write(seeded)
+        self.assertIn("8787", self._run().stdout)
+        with open(path) as f:
+            self.assertEqual(f.read(), seeded)
+
+    def test_unresolvable_settings_stop_us_from_claiming_the_path(self):
+        # ABU_RC != 0 means we do not know who holds the variable. Seeding ourselves in
+        # anyway would overwrite a holder we simply failed to read.
+        with open(os.path.join(self.project, ".claude", "settings.local.json"), "w") as f:
+            f.write("{ not json")
+        self._run()
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".claude", "settings.json")))
+
+    def test_a_missing_home_claude_dir_does_not_silence_the_alert(self):
+        # Observed live: with ~/.claude absent, `2>>"$HOOKLOG"` failed, effective-abu never
+        # ran, and the hook took the "leave settings untouched" branch -- exit 0, empty
+        # stdout, nothing wrong to see. Every other test pre-creates the directory in setUp.
+        shutil.rmtree(os.path.join(self.home, ".claude"))
+        self._displace()
+        self.assertIn("8787", self._run().stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
