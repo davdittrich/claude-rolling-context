@@ -283,7 +283,12 @@ slash commands, so `status` and `unchain` output is not only a human reading a
 terminal: it is tool output the **model** reads in the same conversation. A
 `project` string is never interpolated raw into a message, a log line, or the
 state file; control and non-printable bytes are escaped first, by the same rule
-§7 applies to URLs. The earlier note in §6 about guard messages being read by a
+§7 applies to URLs. What this buys is structural safety — no terminal escape
+sequences, no injected newlines, no corrupted JSON. It does not neutralize a
+directory whose name is plain printable text shaped like an instruction: there is
+nothing there to escape, and it reaches the model as written. That residue is the
+same one §7 already accepts for URL path components, and it is named here so no
+one mistakes escaping for an injection defense. The earlier note in §6 about guard messages being read by a
 person in a terminal describes only their tone, never their escaping.
 
 **Write targets must stay inside the project.** `chain` writes to
@@ -291,6 +296,9 @@ person in a terminal describes only their tone, never their escaping.
 constrain that path, since a clone can ship `.claude` as a symlink pointing
 anywhere; the resolved write target is therefore required to lie inside the
 resolved project root, and `chain` refuses with a named reason when it does not.
+The write step consumes the path the guard already resolved rather than
+re-resolving `<project>/.claude/settings.local.json` at write time, so there is no
+second resolution that could disagree with the one that was validated.
 
 **Recorded paths are canonical.** Every `project` string is `realpath`'d before it
 is stored and before any comparison — removal, prune, and the `refs` membership
@@ -847,7 +855,7 @@ because no test covered state-file version handling at all.
 | `test_unchain_verb.py` | restore vs delete on `displaced: null`; skip when our value is gone; reverse order; project-root scoping, explicitly including the no-ancestor-before-`$HOME` case that must report and exit 0 rather than treating `$HOME/.claude` as the project; `--all` |
 | `test_unchain_shared_key.py` | D17: with A and B both in `shared_upstream.refs`, A's `unchain` removes only A and leaves the key set, so B still resolves at tier 2, and the message names B as still chained; the last project out restores `original`; **out-of-order unchain** (A chains over a pre-existing value, B chains to the same URL, A unchains first, then B) still restores that pre-existing value, which is the case the previous derive-from-`writes` design got wrong; a drifted live value fails the read-back and is left alone rather than overwritten; `--all` empties `refs` in one pass and takes the same guarded restore branch; a `refs` entry whose project is gone is pruned by `chain` and `unchain`, and when it was the last reference the key is restored rather than pinned forever; the prune fires on a project whose `.claude` was deleted while the project root survives, not only on a deleted root; a verb never prunes its own project's entry; paths are `realpath`'d before storage and before every comparison, so a symlinked or relatively-spelled project still matches its own entry; the `shared_upstream` object is gone from the state file after `refs` empties, on both the restored and the read-back-skipped path |
 | `test_loop_protection.py` | D16: a request carrying our own address in `X-Rolling-Context-Chained-From` is refused as a loop; a genuinely different chained-from address forwards normally; an alternate loopback spelling (`localhost` vs `127.0.0.1`) is still caught; the emitted value tracks the live bind address rather than a constant |
-| `test_path_sanitizing.py` | a project directory whose name carries terminal escape sequences or instruction-shaped text reaches `status` output, `unchain` output, the log and the state file escaped, never raw — the same rule `test_dead_upstream.py` pins for URLs; a `.claude` symlink pointing outside the project root is refused by `chain` with the named reason rather than written through |
+| `test_path_sanitizing.py` | a project directory whose name carries terminal escape sequences, newlines, or other control bytes reaches `status` output, `unchain` output, the log and the state file with those bytes escaped — the same rule `test_dead_upstream.py` pins for URLs. This is a **structural** guarantee: no terminal control, no broken log lines, no corrupted JSON. It is not an anti-prompt-injection measure and must not be tested as one — a directory named in plain printable English has no bytes to escape and reaches the model intact, exactly as §7 already accepts for URL path components. Also: a `.claude` symlink pointing outside the project root is refused by `chain` with the named reason rather than written through |
 | `test_state_io.py` | atomic replace; refusal on unparseable state; flock under contention; the file is created mode `0600`, on both the create and the `os.replace` rewrite path; a chained URL written to the state file is re-serialized from the parsed `Upstream`, never the raw string |
 | `test_server_upstream.py` | all four tiers, each `is_self`-guarded; cache invalidation on `mtime_ns` change; D18 — a non-loopback value at tier 2 or 3 is refused and names the offending file, while the same value at tier 1 is honoured |
 | `test_upstream_reaches_socket.py` | the actual frozen-upstream defect: with the daemon running and **not** restarted, change the settings upstream between two requests and assert the second request arrives at the *second* in-process listener. Unmocked sockets — this is the one test that fails if resolution is merely re-parsed and cached without reaching the connection factory (`server.py:151-161`) and the derived sites (`:634`, `:767`, `:865`, `:869`, `:1065`). Every other row in this table passes against a naive string-only fix; this is what `Gemini-b9b.6` actually promises |
