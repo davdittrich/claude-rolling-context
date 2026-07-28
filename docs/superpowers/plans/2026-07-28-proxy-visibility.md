@@ -18,9 +18,10 @@ for the hook and installer.
 **Spec:** `docs/superpowers/specs/2026-07-28-proxy-visibility-design.md` (design-review-gate approved,
 state model narrowed after a plan-gate scope review).
 
-**This plan is end to end.** It fixes all three root bugs and ships the alert and all three verbs.
-PowerShell parity (D3) and the uninstall ordering fixes are the only deferred work, and neither is
-needed for the feature to work on POSIX.
+**This plan is end to end.** It fixes all three root bugs, ships the alert, all three verbs, the
+slash commands the alert names, the uninstall ordering that `chain`'s project-scope write makes
+mandatory, and the docs and version bump. PowerShell parity (D3) is the only deferred work, and it is
+deferred because `pwsh` is absent on this machine, not because it is optional.
 
 ## Global Constraints
 
@@ -1375,9 +1376,12 @@ writes settings that the running proxy never reads, and R3 (no restart) is unrea
 
 **Files:**
 - Modify: `proxy/server.py:71-100` (`_load_upstream`, `UPSTREAM_URL`), `:123-124`
-  (`_parsed_upstream`, `UPSTREAM_PATH`), `:151-161` (connection factory), and the reads at `:634`,
-  `:767`, `:865`, `:869`, `:1065`
-- Test: `tests/test_upstream_reaches_socket.py`
+  (`_parsed_upstream`, `UPSTREAM_PATH`), `:151-161` (connection factory), the reads at `:634`,
+  `:767`, `:865`, `:869`, `:1065`, and the response-header logging at `:642` and `:877`
+- Modify: `proxy/compressor.py:38-40`, `:56-60`, `:445`, `:532`, `:583`, `:593` — the summarizer,
+  which is the compaction path this plugin exists for and freezes exactly like `server.py` does
+- Test: `tests/test_upstream_reaches_socket.py`, `tests/test_summarizer_follows.py`,
+  `tests/test_loop_protection.py`, `tests/test_response_header_logging.py`
 
 **Interfaces:**
 - Consumes: `chain.is_self`, `chain.read_settings` (Tasks 2–3).
@@ -1570,17 +1574,72 @@ def current_upstream():
   at call time through the same accessor, unless `ROLLING_CONTEXT_SUMMARIZER_URL` is set, in which
   case that override stays authoritative (`SUMMARIZER_URL_SET`).
 
-- [ ] **Step 5: Run and verify it passes, then run everything**
+  This is not optional polish: the summarizer *is* the compaction path. A frozen summarizer URL sends
+  compaction traffic to the old upstream while requests go to the new one — the feature silently
+  half-working, which is the class of failure this whole design exists to end.
 
-  Run: `python3 -m unittest tests.test_upstream_reaches_socket -v`
+```python
+# tests/test_summarizer_follows.py
+def test_summarizer_follows_a_changed_upstream(self):
+    self._point_at(A)
+    self.assertEqual(compressor.summarizer_endpoint().port, A)
+    self._point_at(B)
+    self.assertEqual(compressor.summarizer_endpoint().port, B)
+
+def test_explicit_override_still_wins(self):
+    with mock.patch.dict(os.environ,
+                         {"ROLLING_CONTEXT_SUMMARIZER_URL": "http://127.0.0.1:7777"}):
+        self._point_at(B)
+        self.assertEqual(compressor.summarizer_endpoint().port, 7777)
+```
+
+- [ ] **Step 5: Loop protection and response-header filtering**
+
+  Both are small and both are in spec §7. Every forwarded request carries
+  `X-Rolling-Context-Chained-From: <our scheme>://<our host>:<our port>`, built from the live bind
+  address; an inbound request already carrying that header naming *us* is refused as a loop rather
+  than forwarded. `is_self` alone catches only a direct self-chain, not a cycle through an
+  intermediate proxy. Compare with the same `host_matches`/`port_matches` normalization `is_self`
+  uses — a raw string compare misses `localhost` against `127.0.0.1`.
+
+  Response-side header logging at `:642` and `:877` logs header *values* at DEBUG; the request side
+  at `:446`/`:794` is already name-only. Apply the same filter to both — a chained upstream is
+  attacker-influenceable in a way `api.anthropic.com` is not.
+
+```python
+# tests/test_loop_protection.py
+def test_our_own_address_in_the_header_is_refused_as_a_loop(self):
+    handler = make_handler(b"{}", headers={"X-Rolling-Context-Chained-From":
+                                           f"http://127.0.0.1:{server.LISTEN_PORT}"})
+    handler.do_POST()
+    self.assertIn(b"loop", handler.wfile.getvalue().lower())
+
+def test_alternate_loopback_spelling_is_still_caught(self):
+    handler = make_handler(b"{}", headers={"X-Rolling-Context-Chained-From":
+                                           f"http://localhost:{server.LISTEN_PORT}"})
+    handler.do_POST()
+    self.assertIn(b"loop", handler.wfile.getvalue().lower())
+
+def test_a_different_chained_from_address_forwards_normally(self):
+    handler = make_handler(b"{}", headers={"X-Rolling-Context-Chained-From":
+                                           "http://127.0.0.1:9999"})
+    handler.do_POST()
+    self.assertNotIn(b"loop", handler.wfile.getvalue().lower())
+```
+
+- [ ] **Step 6: Run and verify it passes, then run everything**
+
+  Run: `python3 -m unittest tests.test_upstream_reaches_socket tests.test_summarizer_follows tests.test_loop_protection tests.test_response_header_logging -v`
   Expected: PASS — requests land on A then B, no restart.
   Run: `python3 -m unittest discover -s tests`
   Expected: the whole suite green, including the pre-existing compression tests.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add proxy/server.py proxy/compressor.py tests/test_upstream_reaches_socket.py
+git add proxy/server.py proxy/compressor.py tests/test_upstream_reaches_socket.py \
+        tests/test_summarizer_follows.py tests/test_loop_protection.py \
+        tests/test_response_header_logging.py
 git commit -m "fix(proxy): resolve upstream per request, not at import
 
 server.py:100 froze the upstream for the daemon's lifetime, so a live proxy
@@ -1792,6 +1851,256 @@ project's settings.local.json, so it never saw the displacing value."
 
 ---
 
+### Task 9: The slash commands the alert names, plus docs and version
+
+The alert and `status` both print `fix: /rolling-context:chain`. That command has to exist, or the
+single command of R2 fails at the moment it is offered. These are thin wrappers over the verbs Task 6
+already built (D6) — the shell form stays the sole implementation.
+
+**Files:**
+- Create: `commands/chain.md`, `commands/unchain.md`, `commands/status.md`
+- Modify: `README.md`, `.claude-plugin/plugin.json` (2.2.1 → 2.3.0)
+- Create: `CHANGELOG.md`
+- Test: `tests/test_commands_exist.py`
+
+**Interfaces:**
+- Consumes: the CLI verbs from Task 6.
+
+- [ ] **Step 1: Write the failing test**
+
+  The point is not that three files exist — it is that every command string the plugin prints to a
+  user or a model actually resolves to one of them.
+
+```python
+"""Every command the alert or status text names must exist as a slash command (D6, spec section 4).
+
+Run: python3 -m unittest discover -s tests
+"""
+import os
+import re
+import unittest
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _sources():
+    for rel in ("proxy/chain.py", "hooks/start-proxy.sh"):
+        with open(os.path.join(REPO, rel), encoding="utf-8") as f:
+            yield rel, f.read()
+
+
+class CommandsExistTest(unittest.TestCase):
+    def test_every_named_slash_command_has_a_file(self):
+        named = set()
+        for rel, text in _sources():
+            named |= set(re.findall(r"/rolling-context:([a-z-]+)", text))
+        self.assertTrue(named, "expected the alert or status text to name a slash command")
+        for verb in sorted(named):
+            path = os.path.join(REPO, "commands", f"{verb}.md")
+            self.assertTrue(os.path.exists(path), f"{verb} is named but commands/{verb}.md is missing")
+
+    def test_each_command_invokes_the_shell_implementation(self):
+        for verb in ("chain", "unchain", "status"):
+            with open(os.path.join(REPO, "commands", f"{verb}.md"), encoding="utf-8") as f:
+                body = f.read()
+            self.assertIn("chain.py", body, f"commands/{verb}.md must call the one implementation")
+
+    def test_version_was_bumped(self):
+        import json
+        with open(os.path.join(REPO, ".claude-plugin", "plugin.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["version"], "2.3.0")
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+- [ ] **Step 2: Run and verify it fails**
+
+  Run: `python3 -m unittest tests.test_commands_exist -v`
+  Expected: FAIL — `commands/chain.md is missing`, and the version assertion fails on `2.2.1`.
+
+- [ ] **Step 3: Write the three wrappers**
+
+  `commands/chain.md`:
+
+```markdown
+---
+description: Put rolling-context back in the request path, chained through the proxy that displaced it
+---
+
+Run the chain verb and report exactly what it prints:
+
+!`python3 "${CLAUDE_PLUGIN_ROOT}/proxy/chain.py" chain --yes`
+
+If it refused, the message names the reason. Do not retry with different arguments — the refusal
+reasons are deliberate, and each one names what the user should do instead.
+```
+
+  `commands/unchain.md`:
+
+```markdown
+---
+description: Undo the chain, giving back the base URL that rolling-context displaced
+---
+
+!`python3 "${CLAUDE_PLUGIN_ROOT}/proxy/chain.py" unchain`
+```
+
+  `commands/status.md`:
+
+```markdown
+---
+description: Report whether rolling-context is in the request path and what it is chained through
+---
+
+!`python3 "${CLAUDE_PLUGIN_ROOT}/proxy/chain.py" status`
+```
+
+- [ ] **Step 4: Update the docs and the version**
+
+  `README.md` gains a section covering: what the alert means, `chain`/`unchain`/`status`, and that
+  chaining is explicit and never automatic. `.claude-plugin/plugin.json` goes to `2.3.0` — the
+  behaviour change is that the hook no longer writes `ROLLING_CONTEXT_UPSTREAM` for you. Create
+  `CHANGELOG.md` with a `2.3.0` entry naming the three fixed defects.
+
+- [ ] **Step 5: Run and verify it passes**
+
+  Run: `python3 -m unittest tests.test_commands_exist -v`
+  Expected: PASS, 3 tests.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add commands/ README.md CHANGELOG.md .claude-plugin/plugin.json tests/test_commands_exist.py
+git commit -m "feat(commands): add the slash commands the displacement alert names
+
+The alert and status both print /rolling-context:chain. Shipping that text
+without the command would fail R2 at the moment it fires."
+```
+
+---
+
+### Task 10: Uninstall must unchain before it deletes itself
+
+Before this feature, nothing rolling-context owned was ever written into a project-scope file, so
+`uninstall.sh` never needed to clean one up. `do_chain` changes that: it writes
+`ANTHROPIC_BASE_URL` into the project's `settings.local.json`. `uninstall.sh:42-51` removes the plugin
+directory — which contains `chain.sh` — *before* the settings block at `:89-127` runs, and that block
+reads only `$CLAUDE_DIR/settings.json` and never project files.
+
+So: chain, then uninstall, and Claude Code is left pointing at a dead `:5588` with no API
+connectivity at all. This plan introduces that path, so this plan closes it.
+
+**Files:**
+- Modify: `uninstall.sh:42-51` (ordering), `:89-127` (settings block), `:92-95` (silent skip)
+- Test: `tests/test_uninstall.py`
+
+**Interfaces:**
+- Consumes: `chain.py unchain --all` from Task 6.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+"""Uninstall must undo a chain before deleting the code that knows how to undo it.
+
+Run: python3 -m unittest discover -s tests
+"""
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FOREIGN = "http://127.0.0.1:8787"
+
+
+class UninstallTest(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="uninstall-home-")
+        self.project = tempfile.mkdtemp(prefix="uninstall-proj-")
+        os.makedirs(os.path.join(self.home, ".claude"), exist_ok=True)
+        os.makedirs(os.path.join(self.project, ".claude"), exist_ok=True)
+        self.local = os.path.join(self.project, ".claude", "settings.local.json")
+        with open(self.local, "w", encoding="utf-8") as f:
+            json.dump({"env": {"ANTHROPIC_BASE_URL": FOREIGN}}, f)
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.addCleanup(shutil.rmtree, self.project, True)
+
+    def _env(self):
+        return dict(os.environ, HOME=self.home, ROLLING_CONTEXT_NO_START="1")
+
+    def _chain(self):
+        subprocess.run(["python3", os.path.join(REPO, "proxy", "chain.py"), "chain", "--yes"],
+                       cwd=self.project, env=self._env(), capture_output=True, timeout=30)
+
+    def _local_env(self):
+        with open(self.local, encoding="utf-8") as f:
+            return json.load(f).get("env", {})
+
+    def test_uninstall_after_chain_does_not_strand_the_project(self):
+        self._chain()
+        self.assertTrue("5588" in self._local_env()["ANTHROPIC_BASE_URL"])
+        subprocess.run(["bash", os.path.join(REPO, "uninstall.sh")],
+                       env=self._env(), capture_output=True, timeout=60)
+        # The project must not be left pointing at a proxy that no longer exists.
+        self.assertNotIn("5588", self._local_env().get("ANTHROPIC_BASE_URL", ""))
+
+    def test_state_file_and_lock_are_removed(self):
+        self._chain()
+        subprocess.run(["bash", os.path.join(REPO, "uninstall.sh")],
+                       env=self._env(), capture_output=True, timeout=60)
+        state = os.path.join(self.home, ".claude", "rolling-context-proxy.json")
+        self.assertFalse(os.path.exists(state))
+        self.assertFalse(os.path.exists(state + ".lock"))
+
+    def test_a_skipped_step_is_reported_not_silent(self):
+        result = subprocess.run(["bash", os.path.join(REPO, "uninstall.sh")],
+                                env=dict(self._env(), PATH="/nonexistent"),
+                                capture_output=True, text=True, timeout=60)
+        self.assertTrue(result.stdout.strip() or result.stderr.strip(),
+                        "a skipped interpreter check must say so, not exit silently")
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+- [ ] **Step 2: Run and verify it fails**
+
+  Run: `python3 -m unittest tests.test_uninstall -v`
+  Expected: FAIL — the project file still names `:5588` after uninstall, because `chain.sh` was
+  deleted before anything could call it.
+
+- [ ] **Step 3: Reorder `uninstall.sh`**
+
+  `chain.sh unchain --all` runs **first**, before any file is removed. The existing `:109-125`
+  handling of `ROLLING_CONTEXT_*` then finds nothing left to do, which is correct rather than
+  redundant — without the ordering it would restore `ANTHROPIC_BASE_URL` to a possibly-dead port.
+  Make the interpreter guard at `:92-95` report what it skipped instead of skipping silently under
+  `set -e`. Remove `rolling-context-proxy.json` and its `.lock`.
+
+- [ ] **Step 4: Run and verify it passes**
+
+  Run: `python3 -m unittest tests.test_uninstall -v`
+  Expected: PASS, 3 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add uninstall.sh tests/test_uninstall.py
+git commit -m "fix(uninstall): unchain before deleting the code that performs the unchain
+
+uninstall.sh:42-51 removed the plugin directory before the settings block at
+:89-127, and that block never read project files. Once chain writes
+ANTHROPIC_BASE_URL into a project's settings.local.json, that ordering leaves
+Claude Code pointing at a dead :5588 with no API connectivity."
+```
+
+---
+
 ## Done when
 
 - The precedence probe has run and §2 of the spec records what it measured.
@@ -1800,11 +2109,17 @@ project's settings.local.json, so it never saw the displacing value."
   chained through, reported by `status`, and restored by `unchain`.
 - A live `/health` shows the chained upstream rather than `https://api.anthropic.com`, with no daemon
   restart between the `chain` call and the check.
+- `/rolling-context:chain` — the command the alert names — actually runs.
+- Chaining and then uninstalling leaves the project's `ANTHROPIC_BASE_URL` usable, not pointed at a
+  proxy that no longer exists.
 
 ## Deferred, and why it is safe to defer
 
 | Deferred | Why |
 |---|---|
-| PowerShell parity (`start-proxy.ps1`, `install.ps1`, `uninstall.ps1`) | `pwsh` is absent on this machine (D3), so those changes ship review-verified only. POSIX users get the whole feature without them. |
-| Uninstall ordering fixes (`uninstall.sh:42-51` removes the plugin directory before the settings block that needs `chain.sh`) | a real defect, but it only bites at uninstall time and is independent of everything here. |
-| Slash-command wrappers (D6) | the verbs work as `python3 proxy/chain.py <verb>`; wrappers are ergonomics, not function. |
+| PowerShell parity (`start-proxy.ps1:46`, `install.ps1:52`, `uninstall.ps1:101`) | `pwsh` is absent on this machine (D3), so those changes would ship unverified. POSIX users get the whole feature; Windows users keep today's behaviour, which is the pre-existing bug, not a new one. This is the one deferral, and it is a platform gap rather than a scope choice. |
+
+Nothing else is deferred. The slash commands were briefly deferred as "ergonomics" and that was wrong
+— the alert names them, so shipping the alert without them would fail R2 at the moment it fires.
+The uninstall ordering was briefly deferred as "independent" and that was also wrong — `chain`'s
+project-scope write is what makes it reachable, so this plan owns it.
