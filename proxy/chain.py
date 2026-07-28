@@ -135,3 +135,15 @@ def main(argv):
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
+
+
+def display(text):
+    """Escape control and non-printable bytes for any message, log line, or state-file value.
+
+    Structural safety only: no terminal escapes, no injected newlines, no corrupted JSON. A name
+    written in plain printable text has nothing to escape and passes through unchanged -- the same
+    residue section 7 accepts for URL path components.
+    """
+    if text is None:
+        return ""
+    return "".join(ch if ch.isprintable() else repr(ch)[1:-1] for ch in str(text))
