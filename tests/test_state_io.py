@@ -52,6 +52,15 @@ class StateIOTest(unittest.TestCase):
         chain.save_state(chain.empty_state())
         self.assertEqual(stat.S_IMODE(os.stat(chain.state_path()).st_mode), 0o600)
 
+    def test_rewrite_tightens_a_loose_pre_existing_file(self):
+        # A plain in-place open(path, "w") would inherit an existing file's mode
+        # instead of replacing the inode -- this is the test that would catch that.
+        with open(chain.state_path(), "w", encoding="utf-8") as f:
+            f.write("{}")
+        os.chmod(chain.state_path(), 0o644)
+        chain.save_state(chain.empty_state())
+        self.assertEqual(stat.S_IMODE(os.stat(chain.state_path()).st_mode), 0o600)
+
     def test_no_temp_file_is_left_behind(self):
         chain.save_state(chain.empty_state())
         leftovers = [n for n in os.listdir(os.path.join(self.home, ".claude"))
