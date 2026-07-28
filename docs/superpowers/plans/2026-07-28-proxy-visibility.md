@@ -417,6 +417,7 @@ class EffectiveValueTest(unittest.TestCase):
         # patch.dict restores the whole mapping on stop, so these pops are undone with it.
         os.environ.pop("ANTHROPIC_BASE_URL", None)
         os.environ.pop("ROLLING_CONTEXT_UPSTREAM", None)
+        os.environ.pop("ROLLING_CONTEXT_PORT", None)
         self.addCleanup(self.env_patch.stop)
 
     def _write(self, path, value):
@@ -711,6 +712,7 @@ class StateIOTest(unittest.TestCase):
         # patch.dict restores the whole mapping on stop, so these pops are undone with it.
         os.environ.pop("ANTHROPIC_BASE_URL", None)
         os.environ.pop("ROLLING_CONTEXT_UPSTREAM", None)
+        os.environ.pop("ROLLING_CONTEXT_PORT", None)
         self.addCleanup(patch.stop)
 
     def test_absent_state_reads_as_empty(self):
@@ -851,8 +853,8 @@ The user-visible fix. `chain` is the single command from R2; `unchain` gives bac
   `tests/test_entry_point.py`
 
 **Interfaces:**
-- Consumes: `is_self`, `effective`, `display`, `load_state`, `save_state`, `locked`,
-  `UnparseableSettings` (Tasks 2–5).
+- Consumes: `is_self`, `effective`, `display`, `load_state`, `save_state`,
+  `UnparseableSettings` (Tasks 2–5). There is no lock in this design.
 - Produces:
   - `project_root(start) -> str | None` — nearest ancestor containing `.claude`, stopping strictly
     before `$HOME`.
@@ -894,6 +896,7 @@ class ChainVerbTest(unittest.TestCase):
         # patch.dict restores the whole mapping on stop, so these pops are undone with it.
         os.environ.pop("ANTHROPIC_BASE_URL", None)
         os.environ.pop("ROLLING_CONTEXT_UPSTREAM", None)
+        os.environ.pop("ROLLING_CONTEXT_PORT", None)
         self.addCleanup(patch.stop)
         self.local = os.path.join(self.project, ".claude", "settings.local.json")
 
@@ -1047,6 +1050,7 @@ class UnchainTest(unittest.TestCase):
         # patch.dict restores the whole mapping on stop, so these pops are undone with it.
         os.environ.pop("ANTHROPIC_BASE_URL", None)
         os.environ.pop("ROLLING_CONTEXT_UPSTREAM", None)
+        os.environ.pop("ROLLING_CONTEXT_PORT", None)
         self.addCleanup(patch.stop)
 
     def _project(self, name):
@@ -1152,6 +1156,7 @@ class StatusTest(unittest.TestCase):
         # patch.dict restores the whole mapping on stop, so these pops are undone with it.
         os.environ.pop("ANTHROPIC_BASE_URL", None)
         os.environ.pop("ROLLING_CONTEXT_UPSTREAM", None)
+        os.environ.pop("ROLLING_CONTEXT_PORT", None)
         self.addCleanup(patch.stop)
 
     def _run(self):
@@ -1604,6 +1609,7 @@ class UpstreamReachesSocketTest(unittest.TestCase):
         # patch.dict restores the whole mapping on stop, so these pops are undone with it.
         os.environ.pop("ANTHROPIC_BASE_URL", None)
         os.environ.pop("ROLLING_CONTEXT_UPSTREAM", None)
+        os.environ.pop("ROLLING_CONTEXT_PORT", None)
         self.addCleanup(patch.stop)
         self.hits = []
         self.servers = [_listener(A, self.hits), _listener(B, self.hits)]
