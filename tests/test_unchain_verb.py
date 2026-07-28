@@ -94,6 +94,24 @@ class UnchainTest(unittest.TestCase):
     def test_no_project_ancestor_is_an_exit_zero_report(self):
         self.assertEqual(chain.do_unchain(self.home), 0)
 
+    def test_a_project_reached_by_symlink_still_unchains(self):
+        # do_chain keys its state record with os.path.realpath(project); do_unchain
+        # looks that key up via project_root(), which also realpath()s its start.
+        # tempfile.mkdtemp() already returns a real path on this machine, so a
+        # project reached directly would pass even with the realpath() call
+        # removed. Route through a symlink so the normalisation is actually
+        # exercised, matching e.g. macOS's TMPDIR sitting under /var -> /private/var.
+        real = tempfile.mkdtemp(prefix="unchain-real-")
+        os.makedirs(os.path.join(real, ".claude"), exist_ok=True)
+        with open(os.path.join(real, ".claude", "settings.local.json"), "w", encoding="utf-8") as f:
+            json.dump({"env": {"ANTHROPIC_BASE_URL": FOREIGN}}, f)
+        link = os.path.join(tempfile.mkdtemp(prefix="unchain-link-"), "alias")
+        os.symlink(real, link)
+
+        self.assertEqual(chain.do_chain(link, assume_yes=True), 0)
+        self.assertEqual(chain.do_unchain(real), 0)
+        self.assertEqual(self._local_env(real)["ANTHROPIC_BASE_URL"], FOREIGN)
+
 
 if __name__ == "__main__":
     unittest.main()
