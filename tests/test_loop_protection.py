@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import chain
 import server
 
-from _fakes import hermetic_home, make_handler, write_user_settings
+from _fakes import hermetic_home, make_handler, start_listener, write_user_settings
 
 
 class LoopProtectionTest(unittest.TestCase):
@@ -47,6 +47,21 @@ class LoopProtectionTest(unittest.TestCase):
                                                "http://127.0.0.1:9999"})
         handler.do_POST()
         self.assertNotIn(b"loop", handler.wfile.getvalue().lower())
+
+    def test_the_outbound_request_carries_our_chained_from_marker(self):
+        # D16's other half: inbound detection cannot break a two-hop cycle if
+        # we never emit the marker downstream, so observe it on the wire.
+        seen = []
+        httpd = start_listener(5941, seen=seen)
+        self.addCleanup(httpd.shutdown)
+        self.addCleanup(httpd.server_close)
+        write_user_settings(self.home, {"ROLLING_CONTEXT_UPSTREAM": "http://127.0.0.1:5941"})
+        handler = make_handler(b'{"model":"claude-opus-5","messages":[],"max_tokens":1}')
+        handler.do_POST()
+        our_host, our_port = chain.our_bind()
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].get("x-rolling-context-chained-from"),
+                         f"http://{our_host}:{our_port}")
 
 
 if __name__ == "__main__":

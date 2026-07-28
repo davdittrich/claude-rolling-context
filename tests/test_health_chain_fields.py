@@ -8,10 +8,13 @@ import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 from email.message import Message
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "proxy"))
+import chain
 import server
 
 from _fakes import hermetic_home, write_user_settings
@@ -48,6 +51,38 @@ class HealthChainFieldsTest(unittest.TestCase):
     def test_health_url_is_reserialized_not_echoed(self):
         self._write_user_settings({"ROLLING_CONTEXT_UPSTREAM": "http://127.0.0.1:8787/../x"})
         self.assertNotIn("..", _health_json()["upstream_url"])
+
+    def test_health_reports_where_the_upstream_came_from(self):
+        self._write_user_settings({"ROLLING_CONTEXT_UPSTREAM": "http://127.0.0.1:8787"})
+        self.assertEqual(_health_json()["upstream_source"], chain.user_settings_path())
+
+    def test_health_source_names_the_environment_when_the_env_var_wins(self):
+        with mock.patch.dict(os.environ, {"ROLLING_CONTEXT_UPSTREAM": "http://127.0.0.1:8787"}):
+            self.assertEqual(_health_json()["upstream_source"], "<environment>")
+
+    def test_health_source_escapes_control_bytes_in_the_path(self):
+        # Same sanitizing discipline the URL gets: the source path is echoed to
+        # a terminal by `status`, so control bytes must not survive.
+        home = tempfile.mkdtemp(prefix="rolling-context-home-\x1b[31m")
+        os.makedirs(os.path.join(home, ".claude"), exist_ok=True)
+        patch = mock.patch.dict(os.environ, {"HOME": home}, clear=False)
+        patch.start()
+        self.addCleanup(patch.stop)
+        write_user_settings(home, {"ROLLING_CONTEXT_UPSTREAM": "http://127.0.0.1:8787"})
+        server._UPSTREAM_CACHE.update(stamp=None, value=None)
+        self.assertNotIn("\x1b", _health_json()["upstream_source"])
+
+    def test_health_degrades_when_the_settings_file_is_unparseable(self):
+        # /health is the visibility surface this plan exists for: a hand-broken
+        # settings.json must read as a diagnostic, never a traceback.
+        path = os.path.join(self.home, ".claude", "settings.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{ not json")
+        data = _health_json()
+        self.assertEqual(data["status"], "ok")
+        self.assertFalse(data["upstream_reachable"])
+        self.assertIn("not valid JSON", data["upstream_url"])
+        self.assertEqual(data["upstream_source"], path)
 
 
 if __name__ == "__main__":

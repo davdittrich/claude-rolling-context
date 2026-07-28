@@ -116,7 +116,7 @@ compressor = RollingCompressor(
 )
 
 
-Upstream = collections.namedtuple("Upstream", ["scheme", "host", "port", "path"])
+Upstream = collections.namedtuple("Upstream", ["scheme", "host", "port", "path", "source"])
 
 
 class UpstreamRefused(Exception):
@@ -201,11 +201,19 @@ def current_upstream() -> Upstream:
     if from_file and not chain.host_matches(parsed.hostname, "127.0.0.1"):
         raise UpstreamRefused(raw, chain.user_settings_path(), "not-loopback")
 
+    if from_env:
+        source = "<environment>"
+    elif from_file:
+        source = chain.user_settings_path()
+    else:
+        source = "(default)"
+
     value = Upstream(
         parsed.scheme,
         parsed.hostname,
         parsed.port or (443 if parsed.scheme == "https" else 80),
         parsed.path or "",
+        source,
     )
     _UPSTREAM_CACHE.update(stamp=stamp, value=value)
     return value
@@ -899,11 +907,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
         try:
             up = current_upstream()
             upstream_url = f"{up.scheme}://{up.host}:{up.port}"
+            upstream_source = chain.display(up.source)
             chained = up.host != "api.anthropic.com"
             upstream_reachable = _upstream_reachable(up)
         except UpstreamRefused as e:
             upstream_url = f"(refused: {e.reason})"
+            upstream_source = chain.display(e.path)
             chained = True
+            upstream_reachable = False
+        except chain.UnparseableSettings as e:
+            # /health is the visibility surface for exactly this failure: a
+            # hand-broken settings.json must read here as a diagnostic naming
+            # the file, never as a traceback out of do_GET.
+            upstream_url = "(unresolved: settings file is not valid JSON)"
+            upstream_source = chain.display(e.path)
+            chained = False
             upstream_reachable = False
         data = {
             "status": "ok",
@@ -915,6 +933,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "summarizer_model": SUMMARIZER_MODEL or "(session model)",
             "summarizer_mode": "native" if NATIVE_MODE else f"flattened/{SUMMARIZER_FORMAT}",
             "upstream_url": upstream_url,
+            "upstream_source": upstream_source,
             "chained": chained,
             "upstream_reachable": upstream_reachable,
             "compression_count": compressor.compression_count,

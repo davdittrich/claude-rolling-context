@@ -151,6 +151,7 @@ def hermetic_home(testcase):
     os.environ.pop("ANTHROPIC_BASE_URL", None)
     os.environ.pop("ROLLING_CONTEXT_UPSTREAM", None)
     os.environ.pop("ROLLING_CONTEXT_PORT", None)
+    os.environ.pop("ROLLING_CONTEXT_SUMMARIZER_URL", None)
     testcase.addCleanup(patch.stop)
     return home
 
@@ -161,14 +162,17 @@ def write_user_settings(home, env):
         json.dump({"env": env}, f)
 
 
-def start_listener(port, hits=None):
+def start_listener(port, hits=None, seen=None):
     """Spin up a real HTTPServer on 127.0.0.1:port; each POST appends `port`
-    to `hits` (if given) and replays a stub /v1/messages 200 response."""
+    to `hits` (if given) and replays a stub /v1/messages 200 response. Each POST's
+    request headers, lower-cased, are appended to `seen` (if given)."""
     log = hits if hits is not None else []
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             log.append(port)
+            if seen is not None:
+                seen.append({k.lower(): v for k, v in self.headers.items()})
             body = b'{"type":"message","role":"assistant","content":[]}'
             self.send_response(200)
             self.send_header("content-type", "application/json")
