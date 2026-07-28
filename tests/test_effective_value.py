@@ -21,6 +21,8 @@ class EffectiveValueTest(unittest.TestCase):
         os.makedirs(os.path.join(self.project, ".claude"), exist_ok=True)
         self.env_patch = mock.patch.dict(os.environ, {"HOME": self.home}, clear=False)
         self.env_patch.start()
+        os.environ.pop("ANTHROPIC_BASE_URL", None)
+        os.environ.pop("ROLLING_CONTEXT_UPSTREAM", None)
         self.addCleanup(self.env_patch.stop)
 
     def _write(self, path, value):
