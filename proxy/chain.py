@@ -5,9 +5,11 @@ wiring. Pure stdlib: it must import cleanly on Windows, where fcntl does not exi
 
 Spec: docs/superpowers/specs/2026-07-28-proxy-visibility-design.md
 """
+import contextlib
 import json
 import os
 import sys
+import tempfile
 from urllib.parse import urlparse
 
 DEFAULT_PORT = 5588
@@ -147,3 +149,45 @@ def display(text):
     if text is None:
         return ""
     return "".join(ch if ch.isprintable() else repr(ch)[1:-1] for ch in str(text))
+def state_path():
+    return os.path.join(os.path.expanduser("~"), ".claude", "rolling-context-proxy.json")
+
+
+def empty_state():
+    """abu: the key someone else owns, so it carries what we displaced, keyed by project path.
+    upstream: our own key, so it carries only who is still chained through it -- no displaced
+    value, because nothing else writes ROLLING_CONTEXT_UPSTREAM."""
+    return {"abu": {}, "upstream": None, "alerted": []}
+
+
+def load_state():
+    """Absent file reads as empty_state(). Raises UnparseableSettings on bad JSON rather than
+    ever treating a corrupt state file as empty and silently discarding it."""
+    path = state_path()
+    if not os.path.exists(path):
+        return empty_state()
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise UnparseableSettings(path)
+
+
+def save_state(state):
+    """Atomic replace at mode 0600 -- it names project paths and local proxy topology.
+
+    No lock: os.replace is the whole concurrency story (spec section 5). A lock would need
+    fcntl, which does not exist on Windows and this module must import cleanly there.
+    """
+    path = state_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".rolling-context-state-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
