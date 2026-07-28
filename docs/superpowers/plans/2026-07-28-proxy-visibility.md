@@ -405,6 +405,10 @@ class EffectiveValueTest(unittest.TestCase):
         os.makedirs(os.path.join(self.project, ".claude"), exist_ok=True)
         self.env_patch = mock.patch.dict(os.environ, {"HOME": self.home}, clear=False)
         self.env_patch.start()
+        # Hermetic: this machine may export ANTHROPIC_BASE_URL (headroom does).
+        # patch.dict restores the whole mapping on stop, so these pops are undone with it.
+        os.environ.pop("ANTHROPIC_BASE_URL", None)
+        os.environ.pop("ROLLING_CONTEXT_UPSTREAM", None)
         self.addCleanup(self.env_patch.stop)
 
     def _write(self, path, value):
@@ -676,6 +680,10 @@ class StateIOTest(unittest.TestCase):
         os.makedirs(os.path.join(self.home, ".claude"), exist_ok=True)
         patch = mock.patch.dict(os.environ, {"HOME": self.home}, clear=False)
         patch.start()
+        # Hermetic: this machine may export ANTHROPIC_BASE_URL (headroom does).
+        # patch.dict restores the whole mapping on stop, so these pops are undone with it.
+        os.environ.pop("ANTHROPIC_BASE_URL", None)
+        os.environ.pop("ROLLING_CONTEXT_UPSTREAM", None)
         self.addCleanup(patch.stop)
 
     def test_absent_state_reads_as_empty(self):
@@ -844,6 +852,10 @@ class ChainVerbTest(unittest.TestCase):
         os.makedirs(os.path.join(self.project, ".claude"), exist_ok=True)
         patch = mock.patch.dict(os.environ, {"HOME": self.home}, clear=False)
         patch.start()
+        # Hermetic: this machine may export ANTHROPIC_BASE_URL (headroom does).
+        # patch.dict restores the whole mapping on stop, so these pops are undone with it.
+        os.environ.pop("ANTHROPIC_BASE_URL", None)
+        os.environ.pop("ROLLING_CONTEXT_UPSTREAM", None)
         self.addCleanup(patch.stop)
         self.local = os.path.join(self.project, ".claude", "settings.local.json")
 
@@ -993,6 +1005,10 @@ class UnchainTest(unittest.TestCase):
         os.makedirs(os.path.join(self.home, ".claude"), exist_ok=True)
         patch = mock.patch.dict(os.environ, {"HOME": self.home}, clear=False)
         patch.start()
+        # Hermetic: this machine may export ANTHROPIC_BASE_URL (headroom does).
+        # patch.dict restores the whole mapping on stop, so these pops are undone with it.
+        os.environ.pop("ANTHROPIC_BASE_URL", None)
+        os.environ.pop("ROLLING_CONTEXT_UPSTREAM", None)
         self.addCleanup(patch.stop)
 
     def _project(self, name):
@@ -1094,6 +1110,10 @@ class StatusTest(unittest.TestCase):
         os.makedirs(os.path.join(self.project, ".claude"), exist_ok=True)
         patch = mock.patch.dict(os.environ, {"HOME": self.home}, clear=False)
         patch.start()
+        # Hermetic: this machine may export ANTHROPIC_BASE_URL (headroom does).
+        # patch.dict restores the whole mapping on stop, so these pops are undone with it.
+        os.environ.pop("ANTHROPIC_BASE_URL", None)
+        os.environ.pop("ROLLING_CONTEXT_UPSTREAM", None)
         self.addCleanup(patch.stop)
 
     def _run(self):
@@ -1542,6 +1562,10 @@ class UpstreamReachesSocketTest(unittest.TestCase):
         os.makedirs(os.path.join(self.home, ".claude"), exist_ok=True)
         patch = mock.patch.dict(os.environ, {"HOME": self.home}, clear=False)
         patch.start()
+        # Hermetic: this machine may export ANTHROPIC_BASE_URL (headroom does).
+        # patch.dict restores the whole mapping on stop, so these pops are undone with it.
+        os.environ.pop("ANTHROPIC_BASE_URL", None)
+        os.environ.pop("ROLLING_CONTEXT_UPSTREAM", None)
         self.addCleanup(patch.stop)
         self.hits = []
         self.servers = [_listener(A, self.hits), _listener(B, self.hits)]
