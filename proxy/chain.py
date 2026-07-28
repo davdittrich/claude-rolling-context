@@ -5,6 +5,7 @@ wiring. Pure stdlib: it must import cleanly on Windows, where fcntl does not exi
 
 Spec: docs/superpowers/specs/2026-07-28-proxy-visibility-design.md
 """
+import json
 import os
 import sys
 from urllib.parse import urlparse
@@ -53,6 +54,76 @@ def is_self(url):
         return False
     host, our_port = our_bind()
     return host_matches(parsed.hostname, host) and port == our_port
+
+
+class UnparseableSettings(Exception):
+    """A settings file is not valid JSON. We refuse to touch it rather than overwrite it."""
+
+    def __init__(self, path):
+        super().__init__(f"{path} is not valid JSON")
+        self.path = path
+
+
+def user_settings_path():
+    return os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
+
+
+def managed_settings_path():
+    """Administrator policy file. Highest precedence, and unwinnable by a write.
+
+    Paths per the Claude Code settings docs. This covers the file delivery channel only --
+    managed settings can also arrive by macOS plist, Windows registry (HKLM/HKCU), or
+    managed-settings.d/ drop-ins, none of which a stdlib file read can see. The guard below
+    is therefore a courtesy that produces a precise message when it fires; the guarantee that
+    we never leave a write in place that cannot win comes from chain's effective-value
+    read-back, which is channel-agnostic.
+    """
+    if sys.platform == "darwin":
+        return "/Library/Application Support/ClaudeCode/managed-settings.json"
+    if os.name == "nt":
+        return r"C:\ProgramData\ClaudeCode\managed-settings.json"
+    return "/etc/claude-code/managed-settings.json"
+
+
+def settings_scopes(project_root):
+    """Files that can supply a value, highest precedence first (spec section 2, Fact 3)."""
+    scopes = [managed_settings_path()]
+    if project_root:
+        scopes.append(os.path.join(project_root, ".claude", "settings.local.json"))
+        scopes.append(os.path.join(project_root, ".claude", "settings.json"))
+    scopes.append(user_settings_path())
+    return scopes
+
+
+def read_settings(path):
+    """Parsed contents, or {} when absent. Raises UnparseableSettings on invalid JSON."""
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise UnparseableSettings(path)
+
+
+def effective(key, project_root):
+    """(value, source_path) for key, or (None, None).
+
+    Fact 3, measured: managed > project-local > project-shared > user > process-env. The process
+    environment is the WEAKEST scope, not the strongest -- a foreign proxy that only sets a child
+    environment cannot displace a settings-file value, which is exactly why displacement always
+    originates in a file. Checking the environment first would build the whole displacement
+    decision on a value Claude Code itself would not honour.
+    """
+    for path in settings_scopes(project_root):
+        env_block = read_settings(path).get("env") or {}
+        value = env_block.get(key)
+        if value:
+            return value, path
+    from_env = os.environ.get(key)
+    if from_env:
+        return from_env, "<environment>"
+    return None, None
 
 
 def main(argv):
