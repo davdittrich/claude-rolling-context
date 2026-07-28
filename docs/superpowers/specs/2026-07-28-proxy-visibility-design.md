@@ -88,6 +88,10 @@ found it. Where to write is not a free choice.
 | D10 | A second chain is allowed when the foreign URL matches the recorded upstream, and refused on genuine divergence. |
 | D11 | Implement on a fresh branch from `d987048`, porting only what a failing test for the new behaviour justifies. |
 | D12 | The chained upstream is recorded in `ROLLING_CONTEXT_UPSTREAM` in `~/.claude/settings.json` — the existing mechanism (R4) — not in a field of our own. |
+| D13 | `chain` refuses any non-loopback foreign URL outright, no opt-out. Full request headers, including the API key, are forwarded to whatever `ROLLING_CONTEXT_UPSTREAM` names (`server.py:437-443`); the only use case in scope is a local proxy, so there is nothing to trade off. |
+| D14 | Before the `~/.claude/settings.json` write — the scope-escalation step, since it becomes upstream for every project on the machine — `chain` prints the destination and an explicit statement that all API traffic, machine-wide, will route through it, and requires confirmation: interactive `y/N`, or `--yes` for scripted use. Still one command (R2): confirmation is a step inside running it, not a second command. |
+| D15 | The per-request upstream accessor returns a small parsed struct (`scheme`, `host`, `port`, `path`), not a plain string. A string accessor only fixes the literal `UPSTREAM_URL` sites; it misses `_parsed_upstream`, `UPSTREAM_PATH`, and the connection factory (`server.py:123-124,151-161`), which is why a naive fix would not actually kill the frozen-upstream bug. |
+| D16 | Loop protection beyond `is-self`: every chained forward carries `X-Rolling-Context-Chained-From: <our own scheme>://<our own host>:<our own port>`. An inbound request already carrying that header naming this daemon's own address is refused as a loop rather than forwarded — `is-self` alone only catches a direct self-chain, not a longer cycle through an intermediate proxy. |
 
 Carried from earlier: **D3** — `pwsh` is absent on this machine, so all `.ps1`
 changes ship review-verified only, recorded as `pwsh-absent`, stated in the commit
@@ -168,7 +172,7 @@ links the plugin at `$HOME/.claude/plugins/rolling-context`.
       "displaced": "http://127.0.0.1:8787"
     }
   ],
-  "alerted": ["http://127.0.0.1:8787"]
+  "alerted": [{"project": "/home/dd/proj/A", "url": "http://127.0.0.1:8787"}]
 }
 ```
 
@@ -178,7 +182,12 @@ Two fields:
   the read-back guard; `displaced` powers strict undo (D7). `"displaced": null`
   means the key was absent before us, so undo deletes it. `unchain` walks the list
   in reverse.
-- **`alerted`** — foreign URLs already announced (D8).
+- **`alerted`** — `{project, url}` pairs already announced (D8). Keyed on project,
+  not just URL: `headroom wrap claude` binds the same port every time, so a
+  URL-only key alerts the user exactly once in the lifetime of the install and
+  goes silent in every project after the first — reproducing the defect this
+  design exists to fix, one field over. A pair is "alerted" only once its own
+  `{project, url}` tuple has been recorded.
 
 **No `upstream` field** (D12) — the chained upstream is `ROLLING_CONTEXT_UPSTREAM`
 in `~/.claude/settings.json`, which is also the value the daemon and
@@ -197,34 +206,65 @@ so any branch-era leftover is ignored. `_from_v1`, `_migrate_v1_locked` and
 
 Each traces to a specific past failure:
 
-- `fcntl.flock` retained — every session's `SessionStart` may append to `alerted`,
-  so the race is real.
+- Lock scope: the state-file lock is held from before guard evaluation through
+  both settings writes, both read-backs, and the state-file write — not narrowly
+  around the `alerted` append. D10 explicitly permits concurrent `chain` calls
+  from different projects; without this scope two concurrent applies can
+  interleave their read-backs against each other's writes.
+- POSIX: `fcntl.flock` on the state file, held for the scope above. Windows has
+  no `fcntl`; the Windows path uses `msvcrt.locking` on the same file under the
+  same critical section, selected by a top-of-module platform check so the
+  `fcntl` import itself never executes on Windows — a module-level `import fcntl`
+  on Windows breaks `is-self` (and everything that imports `chain.py`) on every
+  invocation, including from `.ps1` callers.
 - Atomic `tmp` + `os.replace`.
 - **Unparseable JSON → refuse and report, never overwrite.** Review round 4 found a
   fallback to `{}` that destroyed an entire settings file. Applies to the state
   file and to every settings file we touch.
 - Settings files are read, mutated in memory, and written back whole — never
   regenerated.
+- The state file is written `0600`: it names project paths and the topology of a
+  locally-chained proxy, and there's no reason another local user should read it.
 
 ## 6. Verbs
 
 Shared resolution: walk scopes in the Fact 3 order and return the winning value
 **and the file it came from**. Displaced = the winner is not ours.
 
+### `is-self`
+
+The single predicate all seven call sites (`server.py:93` plus the six shell/
+PowerShell sites collapsed in §9) reduce to. Contract:
+
+```
+is_self(url) := parse(url).scheme in {http, https}
+             and host_matches(parse(url).host, OUR_BIND_HOST)
+             and port_matches(parse(url).port_or_default, OUR_BIND_PORT)
+```
+
+`OUR_BIND_HOST`/`OUR_BIND_PORT` come from the daemon's own actual bind address at
+call time (never a hardcoded `127.0.0.1:5588`), so a non-default
+`ROLLING_CONTEXT_PORT` still self-detects correctly. `host_matches` treats
+`127.0.0.1`, `::1`, and `localhost` as equivalent; a bare host with no port uses
+the scheme's default (80/443) before comparing. `same-port-different-host` (below)
+is the guard for the case this predicate correctly does **not** catch: a foreign
+proxy on our port but a different host is not us, and chaining to it is legal.
+
 ### `chain`
 
-Guards, in order. Each refuses with a named reason and writes nothing; the two
-no-ops exit 0.
+Guards, in order. Each refuses with a named reason, a fixed user-facing message,
+and writes nothing; the two no-ops exit 0.
 
-| Reason | Condition | Exit |
-|---|---|---|
-| `not-displaced` | the winner is already ours | 0 |
-| `nothing-to-chain` | the winner is the default API; no foreign proxy | 0 |
-| `managed-scope` | the foreign value lives in `managed-settings.json` — unwinnable | 2 |
-| `same-port-different-host` | the foreign URL uses our port on another host | 2 |
-| `divergent-chain` | `ROLLING_CONTEXT_UPSTREAM` in `~/.claude/settings.json` is set to a different URL (D10) | 2 |
-| `upstream-pinned-by-env` | `ROLLING_CONTEXT_UPSTREAM` is set in the process environment | 2 |
-| `unparseable-settings` | a target settings file or the state file is invalid JSON | 2 |
+| Reason | Condition | Exit | Message |
+|---|---|---|---|
+| `not-displaced` | the winner is already ours | 0 | `already chained through you — nothing to do` |
+| `nothing-to-chain` | the winner is the default API; no foreign proxy | 0 | `no foreign proxy detected — nothing to chain` |
+| `non-loopback` | the foreign URL's host is not loopback (D13) | 2 | `refusing to chain to <url> — not a loopback address. rolling-context only chains to local proxies (127.0.0.1/::1/localhost); chaining elsewhere would forward your API key off-machine` |
+| `managed-scope` | the foreign value lives in `managed-settings.json` — unwinnable | 2 | `<url> is set by managed-settings.json — an administrator policy, not something rolling-context can override` |
+| `same-port-different-host` | the foreign URL uses our port on another host | 2 | `<url> uses our own port on a different host — refusing, this looks like a misconfiguration rather than a proxy to chain to` |
+| `divergent-chain` | `ROLLING_CONTEXT_UPSTREAM` in `~/.claude/settings.json` is set to a different URL (D10) | 2 | `already chained to <existing>; <url> is a different proxy. run 'unchain' first if you want to switch` |
+| `upstream-pinned-by-env` | `ROLLING_CONTEXT_UPSTREAM` is set in the process environment | 2 | `ROLLING_CONTEXT_UPSTREAM is set in your shell environment (<value>) — settings can't override that. unset it or edit your shell config instead` |
+| `unparseable-settings` | a target settings file or the state file is invalid JSON | 2 | `<path> is not valid JSON — refusing to touch it. fix the file by hand and retry` |
 
 `divergent-chain` compares against the settings value only, and allows the matching
 case: a second project wrapped by the same proxy URL needs the same upstream, so it
@@ -235,23 +275,35 @@ variable exported, writing it to settings would change nothing, so `chain` refus
 and names the variable rather than appearing to succeed. This is the surviving arm
 of the previous design's D4.
 
-Apply, **upstream first, base URL second**:
+Apply, **upstream first, base URL second**, under the state-file lock (D10's
+concurrent-chain guarantee depends on this lock covering the whole sequence, not
+just the final write — see §5 Writing rules):
 
-1. Record both intended `writes` entries in the state file.
-2. Write `ROLLING_CONTEXT_UPSTREAM` = the foreign URL to `~/.claude/settings.json`.
-3. Write `ANTHROPIC_BASE_URL` = `http://127.0.0.1:$ROLLING_CONTEXT_PORT` to the
+1. Print the scope-escalation notice and get confirmation (D14) before doing
+   anything else: `chain` is about to make `<url>` upstream for every project on
+   this machine, via `~/.claude/settings.json`. Requires `y` or `--yes`.
+2. Record both intended `writes` entries in the state file.
+3. Write `ROLLING_CONTEXT_UPSTREAM` = the foreign URL to `~/.claude/settings.json`.
+4. Write `ANTHROPIC_BASE_URL` = `http://127.0.0.1:$ROLLING_CONTEXT_PORT` to the
    file that displaced us.
-4. Read both back. On mismatch, undo in reverse and report failure.
+5. Read both back. On mismatch, undo in reverse and report failure.
 
-The order is not arbitrary. Reversing it would point Claude Code at us before we
-know where to forward, and "no upstream recorded" resolves to the default API —
-silently un-chaining the user, which D9 forbids.
+The order of steps 3-4 is not arbitrary. Reversing it would point Claude Code at us
+before we know where to forward, and "no upstream recorded" resolves to the default
+API — silently un-chaining the user, which D9 forbids.
 
 ### `unchain`
 
-Scope: entries whose `path` lies inside the current project root (nearest ancestor
-containing `.claude`), plus the `~/.claude` upstream entry that belongs to them.
-Uninstall passes `--all`.
+Scope: entries whose `path` lies inside the **project root** — the nearest
+ancestor of the current directory, stopping strictly before `$HOME`, that
+contains a `.claude` directory — plus the `~/.claude` upstream entry that belongs
+to them. If no such ancestor exists between the current directory and `$HOME`
+(exclusive), there is no project-scoped entry to unchain; report that and exit 0.
+This exclusion is load-bearing: `$HOME/.claude` always exists, so a walk that
+doesn't stop before it would treat the user's home directory as "the project" for
+any cwd lacking its own `.claude`, silently widening every plain `unchain` call to
+`--all`'s scope. Uninstall passes `--all` explicitly, which skips this walk
+entirely and matches every recorded entry.
 
 Per entry, in reverse order, **read back before writing**: if the current value
 equals our `wrote`, restore `displaced` byte-exact, or delete the key when
@@ -302,8 +354,29 @@ Order, every branch guarded by `is_self` so we can never route to ourselves:
 Tiers 1–4 are the shipped `_load_upstream` shape with the freeze removed and a
 correct self-check, not a new mechanism.
 
+**Accessor shape (D15).** The accessor returns `Upstream(scheme, host, port,
+path)`, parsed once per resolution and cached (below), not a plain string. This is
+the fix for the actual bug: `server.py:100`'s single `UPSTREAM_URL` assignment is
+not the only frozen value downstream of it — `_parsed_upstream` (`:123`) and
+`UPSTREAM_PATH` (`:124`) are separately derived at import time and read again at
+`:634`, `:767`, `:865`, `:869`, `:1065`, and the connection factory at `:151-161`
+builds its socket directly from `_parsed_upstream.scheme/.hostname/.port`. A
+string-only accessor leaves every one of those frozen. Six literal `UPSTREAM_URL`
+consumers plus these three derived-value sites all become reads of the one
+`Upstream` struct.
+
 **Caching:** `stat()` `~/.claude/settings.json` per request; re-read only when
 `mtime_ns` or size change. Atomic `os.replace` makes the stat a reliable trigger.
+The parsed `Upstream` struct is cached alongside the raw string and invalidated on
+the same trigger, so callers never re-parse per request.
+
+**Loop protection (D16).** Every forwarded request carries
+`X-Rolling-Context-Chained-From: <our scheme>://<our host>:<our port>`, using the
+daemon's own live bind address, not a hardcoded value. An inbound request that
+already carries this header naming *this* daemon's own address is refused with a
+loop-detected error rather than forwarded — `is_self` only catches chaining
+directly to ourselves; this catches a longer cycle formed through an intermediate
+proxy that (mis)configures its own upstream back at us.
 
 **Dead upstream (D9).** Connection-level failure — refused, DNS failure,
 unreachable — returns an Anthropic-shaped error body, so Claude Code renders it as
@@ -316,7 +389,12 @@ a message rather than a transport crash:
 
 `<resolved>` is computed from the running server's own location, never hardcoded —
 the plugin may be a symlink at `$HOME/.claude/plugins/rolling-context` or a
-checkout elsewhere.
+checkout elsewhere. The upstream URL embedded in this message is the parsed
+`Upstream` struct re-serialized from its validated fields, never the raw string
+interpolated verbatim — the same rule applies everywhere a chained URL reaches a
+message or a file (state file, `/health`, this error), closing the path from an
+attacker-controlled or malformed URL string to injected text in output a user or
+model reads.
 
 The message names the **shell** form, not the slash command: the model cannot
 answer while its own requests are failing, so the escape hatch must not require a
@@ -327,13 +405,21 @@ through untouched; only failures to reach it produce this.
 **Two consumers that must follow the upstream or fail silently:**
 
 - **The summarizer.** `compressor.py:38-40` derives `SUMMARIZER_BASE_URL` from
-  `ROLLING_CONTEXT_UPSTREAM` at import and `:56-60` freezes host, port, scheme and
-  path. With a per-request upstream, a frozen summarizer URL sends compaction
-  traffic to the wrong place — the feature being restored, failing quietly. It
-  resolves at call time, unless `ROLLING_CONTEXT_SUMMARIZER_URL` is set, in which
-  case that override stays authoritative (`SUMMARIZER_URL_SET`).
-- **The nine `UPSTREAM_URL` string consumers** in `server.py` become calls to one
-  accessor returning a plain string, so no call site starts handling a tuple.
+  `ROLLING_CONTEXT_UPSTREAM` at import, `:56-60` freezes host, port, scheme and
+  path, and `:445`, `:532`, `:583`, `:593` build request paths from the frozen
+  value (plus log lines at `:534`, `:611`). With a per-request upstream, a frozen
+  summarizer URL sends compaction traffic to the wrong place — the feature being
+  restored, failing quietly. It resolves at call time via the same `Upstream`
+  accessor, unless `ROLLING_CONTEXT_SUMMARIZER_URL` is set, in which case that
+  override stays authoritative (`SUMMARIZER_URL_SET`).
+- **The `UPSTREAM_URL` string and derived-value consumers** in `server.py`
+  (enumerated above) become calls to the one `Upstream` accessor.
+
+**Response header logging.** Request-side header logging (`:446`, `:794`) is
+already name-only/filtered; response-side (`:642`, `:877`) currently logs header
+*values* unfiltered at DEBUG. Same filter applies to both — a chained upstream is
+attacker-influenceable in a way `api.anthropic.com` is not, so this stops being a
+theoretical gap once chaining ships.
 
 `/health` gains `chained` and `upstream_reachable` beside the sanitized
 `upstream_url` and `upstream_source`. `status` reads it rather than duplicating
@@ -361,17 +447,48 @@ going quiet stays recoverable.
 
 ### Suppression (D8), with one refinement
 
+Keyed per `{project, url}` (§5) — not URL alone. Headroom binds a fixed port, so a
+URL-only key would alert once across the entire install's lifetime, the original
+bug in a new place: project B's first encounter with the same displacing proxy
+would be silently suppressed by project A's earlier alert.
+
 | Situation | Alert? |
 |---|---|
-| foreign URL not in `alerted` | yes, then record it |
-| foreign URL in `alerted`, no write recorded for that file | no |
-| foreign URL in `alerted`, **a write is recorded for that file** | **yes** — our chain was displaced |
+| foreign URL not in `alerted` for this project | yes, then record it |
+| foreign URL in `alerted` for this project, no write recorded for that file | no |
+| foreign URL in `alerted` for this project, **a write is recorded for that file** | **yes** — our chain was displaced |
 
 The third row uses different wording ("your chain was overwritten") and does not
 depend on which tool did it. Silence there would recreate the original bug in a new
 place.
 
 There is no "everything is fine" line. Silence plus `status` is the contract.
+
+### Upstream-key drift (distinct from displacement)
+
+Displacement is `ANTHROPIC_BASE_URL` no longer pointing at us. A second, separate
+failure mode is `ANTHROPIC_BASE_URL` still pointing at us while
+`ROLLING_CONTEXT_UPSTREAM` — the value `chain` wrote — has itself changed or gone
+missing underneath us: another tool rewrites `~/.claude/settings.json` wholesale
+and drops or overwrites the key, or a hand-edit clobbers it. Nothing in the
+displacement check above would catch this, because from `ANTHROPIC_BASE_URL`'s
+point of view nothing changed — we are still in the request path — but we are now
+silently chaining somewhere the user did not choose, or silently un-chained.
+
+Detected the same way as displacement: `SessionStart` compares the live
+`ROLLING_CONTEXT_UPSTREAM` value against what `chain`'s write recorded (§5) for
+this project. Mismatch fires the same two-field contract:
+
+```json
+{"hookSpecificOutput":{"hookEventName":"SessionStart",
+  "additionalContext":"rolling-context's chain target changed outside of /rolling-context:chain — was http://127.0.0.1:8787, is now <current>. Verify this is intended, or re-run /rolling-context:chain."},
+ "systemMessage":"[rolling-context] chain target changed outside chain.sh: was http://127.0.0.1:8787, now <current>.
+  check: /rolling-context:status     re-chain: /rolling-context:chain <url>"}
+```
+
+Suppressed by the same per-project `alerted` record, keyed on the pair (old
+recorded value, new observed value) so a second unrelated drift after the first is
+still surfaced.
 
 ## 9. Install, uninstall, and the predicate sites
 
@@ -419,13 +536,18 @@ must cover both orders to keep the dependency explicit.
 
 Seven sites with four different semantics — `start-proxy.sh:63`,
 `start-proxy.ps1:46`, `install.sh:63`, `install.ps1:52`, `uninstall.sh:111`,
-`uninstall.ps1:101`, `server.py:93` — collapse to one implementation. Shell and
-PowerShell call `python3 chain.py is-self <url>`.
+`uninstall.ps1:101`, `server.py:93` — collapse to one implementation, whose
+contract is defined in §6 (`is-self`). Shell calls `python3 chain.py is-self
+<url>`; PowerShell calls `python chain.py is-self <url>`, matching the existing
+convention at `start-proxy.ps1:101`, `install.ps1:18` and `install.ps1:102` —
+`python3` is frequently absent from `PATH` on Windows, so a `python3` invocation
+from a `.ps1` would fail on exactly the platform it runs on.
 
 `grep '127\.0\.0\.1'` **undercounts these sites**: the `.ps1` files store escaped
-dots, which is how a site was missed before. Legitimate non-predicate literals:
+dots (`127\.0\.0\.1` inside a `-notmatch` regex), which is how a site was missed
+before. Legitimate non-predicate literals, which the migration must leave alone:
 `start-proxy.sh:11`, `install.sh:11`, `start-proxy.ps1:13`, `install.ps1:27`,
-`server.py:1090` (bind address).
+`server.py:1068` (the listener's own bind address).
 
 ## 10. Verification
 
@@ -443,16 +565,28 @@ because no test covered state-file version handling at all.
 | `test_server_upstream.py` | all four tiers, each `is_self`-guarded; cache invalidation on `mtime_ns` change |
 | `test_dead_upstream.py` | connection refused → Anthropic-shaped body; per-tier wording; the resolved path is the server's own; live upstream statuses pass through |
 | `test_summarizer_follows.py` | the summarizer tracks a changed upstream; the explicit override still wins |
-| `test_hook_output.py` | stdout is exactly one JSON object or empty; `systemMessage` present when displaced; the three-row suppression matrix; diagnostics never on stdout |
+| `test_hook_output.py` | stdout is exactly one JSON object or empty; `systemMessage` present when displaced; the three-row suppression matrix keyed per `{project, url}` — including two projects, same displacing URL, both alerted; diagnostics never on stdout |
+| `test_upstream_drift.py` | live `ROLLING_CONTEXT_UPSTREAM` differing from the recorded value fires the drift alert while `ANTHROPIC_BASE_URL` still points at us; the key going missing fires it; a second, different drift after the first is not suppressed |
+| `test_status_verb.py` | reports chained/not-chained, the effective upstream and its source file, and reachability; exit codes distinguish healthy from displaced; it reads `/health` rather than re-deriving |
+| `test_health_chain_fields.py` | `/health` exposes `chained` and `upstream_reachable` beside a sanitized `upstream_url` and `upstream_source`; the URL is re-serialized from the parsed struct, never echoed raw |
+| `test_install_seeding.py` | the three-case seeding table (absent / ours / foreign) in `install.sh` and `start-proxy.sh`, with the foreign case writing nothing and printing guidance |
+| `test_state_version.py` | an unknown/newer `version` in the state file is refused rather than silently coerced; a missing `version` is refused; the current version round-trips |
 | `test_uninstall.py` | `unchain --all` before directory removal; skips reported; state file and lock removed |
 
-Port from the old branch: `test_chain_write.py:238`
-(`test_timeout_is_a_logged_noop_not_a_block`) kills a `threading.Lock` mutant that
-the threaded barrier test is blind to (0/15). It must not be weakened.
+Port from the old branch: `test_chain_write.py:231`
+(`test_timeout_is_a_logged_noop_not_a_block`, on `feat/upstream-chaining`) kills a
+`threading.Lock` mutant that the threaded barrier test is blind to (0/15). It must
+not be weakened.
 
-**End-to-end, unmocked**, by the method that produced Facts 1 and 2 — real local
-listeners, no API contact: a chained request must arrive at the foreign listener
-with compaction applied, and a dead upstream must yield the guidance error.
+**End-to-end, unmocked**, by the method that produced Facts 1 and 2 — in-process
+local listeners started by the test itself, no API contact and no container: a
+chained request must arrive at the foreign listener with compaction applied, and a
+dead upstream must yield the guidance error. Explicitly **not** via
+`docker-compose.e2e.yml`, which sets `ROLLING_CONTEXT_UPSTREAM=https://api.anthropic.com`
+in the environment — tier 1 of §7, which the `upstream-pinned-by-env` guard in §6
+refuses to chain over. Running the chain E2E in that harness would test the refusal
+path, not the chain. The in-process listeners the Fact 1/Fact 3 spikes already used
+are the model.
 
 Tests importing `_fakes` run via `python3 -m unittest discover -s tests`.
 
@@ -466,7 +600,8 @@ Tests importing `_fakes` run via `python3 -m unittest discover -s tests`.
 | `unchain` always restores byte-exact | writes back a dead port after the other proxy exits |
 | `unchain` always deletes the key | discards a project endpoint the user configured before we ran |
 | Automatic chaining on detection | the whole of the rejected design; requires writing files we do not own, unasked, which forces the journal, revert, ownership guards and retention rules |
-| Alert on every displaced session | rejected in favour of once-per-URL plus `status` (D8) |
+| Alert on every displaced session | rejected in favour of once per `{project, url}` plus `status` (D8) |
+| `chain` to a non-loopback URL behind an opt-out flag | the flag's only effect would be to forward the user's API key to an off-machine host (`server.py:437-443`); no in-scope use case needs it, and a flag that exists is a flag that gets pasted from a forum (D13) |
 | Fall back to the API when the chained upstream is dead | routes traffic the user did not ask for (D9) |
 | Newest chain wins across divergent projects | one daemon has one upstream and a request carries no project identity; taking over would silently mis-route the other project |
 | Per-project concurrent upstreams | requires per-request routing the single daemon cannot provide |
@@ -476,4 +611,19 @@ Tests importing `_fakes` run via `python3 -m unittest discover -s tests`.
 
 ## 12. Open items
 
-None blocking implementation. Next step: `writing-plans`.
+One, to be resolved by probe during implementation rather than assumed:
+
+**Tier-1-over-tier-2 precedence is asserted, not measured.** §7 states that
+`ROLLING_CONTEXT_UPSTREAM` from the process environment beats the value in
+`~/.claude/settings.json`. That is how our own resolver will be written, so within
+our code it is true by construction — but the claim that matters is the one about
+*Claude Code's* behaviour when both are present, and no probe in §2 measured it.
+Fact 3 measured project-`settings.local.json` versus inherited process env for
+`ANTHROPIC_BASE_URL`, which is a different pair of sources and a different key.
+Before implementing the `upstream-pinned-by-env` guard (§6), run a probe in the
+style of the Fact 1/Fact 3 spikes — set both, observe which one a live session
+actually uses — and record the result here as a measured fact. If the measurement
+contradicts the assumption, the guard's refusal message and the tier order both
+change.
+
+Next step after that item is recorded: `writing-plans`.
