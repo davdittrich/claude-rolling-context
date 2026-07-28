@@ -27,7 +27,11 @@ deferred because `pwsh` is absent on this machine, not because it is optional.
 
 - Pure stdlib. No new dependencies. `proxy/server.py` and `proxy/compressor.py` are stdlib-only today.
 - Tests run via `python3 -m unittest discover -s tests` from the repo root.
-- Test files live in `tests/`, named exactly as §10 of the spec names them.
+- Test files live in `tests/`, named exactly as §10 of the spec names them. Every file §10 names is
+  built by some task in this plan — §10 is the checklist, and nothing on it is silently skipped.
+  `test_effective_value.py` and `test_state_version.py` are the two exceptions and both are
+  deliberate: the first is built here under that exact name, the second was deleted from §10 when the
+  state-file version refusal was cut.
 - Never hardcode `5588`. The port comes from `ROLLING_CONTEXT_PORT` or defaults to `5588`, matching
   `proxy/server.py:47`.
 - `fcntl` is POSIX-only. Any import of it sits behind a platform check so `chain.py` imports cleanly on
@@ -841,7 +845,10 @@ The user-visible fix. `chain` is the single command from R2; `unchain` gives bac
   - `Refusal` — exception carrying `.reason` and `.message`.
   - `do_chain(project, assume_yes=False) -> int`, `do_unchain(project, all_=False) -> int`,
     `do_status(project) -> int` — exit codes per the Global Constraints.
-  - CLI verbs: `chain [--yes]`, `unchain [--all]`, `status`.
+  - CLI verbs: `chain [--yes]`, `unchain [--all]`, `status`, and `effective-abu` — which prints the
+    winning `ANTHROPIC_BASE_URL` and nothing else, because Task 8's hook consumes it as
+    `$(chain.py effective-abu)`. Without this verb the hook's detection is dead and the whole
+    feature silently no-ops.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -937,6 +944,34 @@ class ChainVerbTest(unittest.TestCase):
         self._displace()
         with mock.patch.dict(os.environ, {"ROLLING_CONTEXT_UPSTREAM": FOREIGN}):
             self.assertEqual(chain.do_chain(self.project, assume_yes=True), 2)
+
+    def test_effective_abu_prints_the_winning_value_and_nothing_else(self):
+        # The hook consumes this as $(chain.py effective-abu). Extra output breaks it.
+        self._displace()
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = chain.main(["effective-abu"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(buf.getvalue().strip(), FOREIGN)
+
+    def test_matching_url_second_chain_succeeds_and_appends_a_ref(self):
+        # D10: a second project through the same proxy needs the same upstream.
+        self._displace()
+        chain.do_chain(self.project, assume_yes=True)
+        other = tempfile.mkdtemp(prefix="chain-proj2-")
+        os.makedirs(os.path.join(other, ".claude"), exist_ok=True)
+        with open(os.path.join(other, ".claude", "settings.local.json"), "w") as f:
+            json.dump({"env": {"ANTHROPIC_BASE_URL": FOREIGN}}, f)
+        self.assertEqual(chain.do_chain(other, assume_yes=True), 0)
+        self.assertEqual(chain.load_state()["upstream"]["refs"], [self.project, other])
+
+    def test_env_override_without_displacement_is_a_noop_not_a_refusal(self):
+        # A user with a legitimate ROLLING_CONTEXT_UPSTREAM and nothing displacing them
+        # should be told there is nothing to chain, not told to unset their variable.
+        with mock.patch.dict(os.environ, {"ROLLING_CONTEXT_UPSTREAM": FOREIGN}):
+            self.assertEqual(chain.do_chain(self.project, assume_yes=True), 0)
 
     def test_unparseable_settings_refuses_and_leaves_the_file(self):
         with open(self.local, "w", encoding="utf-8") as f:
@@ -1168,17 +1203,21 @@ def _read_key(path, key):
 
 
 def _guards(project, state):
-    """Every guard refuses with a named reason and writes nothing."""
-    if os.environ.get(USER_KEY):
-        raise Refusal("upstream-pinned-by-env",
-                      f"{USER_KEY} is set in your shell environment "
-                      f"({display(os.environ[USER_KEY])}) — settings can't override that. "
-                      f"unset it or edit your shell config instead")
+    """Every guard refuses with a named reason and writes nothing.
+
+    Displacement is checked FIRST: a user with a legitimate exported upstream and nothing
+    displacing them should hear "nothing to chain", not "unset your variable".
+    """
     value, source = effective(ABU_KEY, project)
     if value is None:
         return None, None
     if is_self(value):
         return None, None
+    if os.environ.get(USER_KEY):
+        raise Refusal("upstream-pinned-by-env",
+                      f"{USER_KEY} is set in your shell environment "
+                      f"({display(os.environ[USER_KEY])}) — settings can't override that. "
+                      f"unset it or edit your shell config instead")
     host = urlparse(value).hostname
     if not host_matches(host, "127.0.0.1"):
         raise Refusal("non-loopback",
@@ -1349,6 +1388,16 @@ def main(argv):
         return do_unchain(cwd, all_="--all" in rest)
     if verb == "status":
         return do_status(project_root(cwd) or cwd)
+    if verb == "effective-abu":
+        # What the hook calls. Prints the winning ANTHROPIC_BASE_URL and nothing else, so
+        # `$(chain.py effective-abu)` is directly usable in shell. Empty output means unset.
+        try:
+            value, _ = effective(ABU_KEY, project_root(cwd) or cwd)
+        except UnparseableSettings:
+            return 2
+        if value:
+            print(value)
+        return 0
     sys.stderr.write(f"unknown verb: {verb}\n")
     return 1
 ```
@@ -1356,7 +1405,7 @@ def main(argv):
 - [ ] **Step 4: Run and verify they pass**
 
   Run: `python3 -m unittest tests.test_chain_verb tests.test_unchain_refs tests.test_status_verb -v`
-  Expected: PASS, 19 tests.
+  Expected: PASS, 23 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -1376,12 +1425,14 @@ writes settings that the running proxy never reads, and R3 (no restart) is unrea
 
 **Files:**
 - Modify: `proxy/server.py:71-100` (`_load_upstream`, `UPSTREAM_URL`), `:123-124`
-  (`_parsed_upstream`, `UPSTREAM_PATH`), `:151-161` (connection factory), the reads at `:634`,
+  (`_parsed_upstream`, `UPSTREAM_PATH`), `:149-163` (connection factory, full body), the reads at `:630` (a log line), `:634`,
   `:767`, `:865`, `:869`, `:1065`, and the response-header logging at `:642` and `:877`
 - Modify: `proxy/compressor.py:38-40`, `:56-60`, `:445`, `:532`, `:583`, `:593` — the summarizer,
   which is the compaction path this plugin exists for and freezes exactly like `server.py` does
-- Test: `tests/test_upstream_reaches_socket.py`, `tests/test_summarizer_follows.py`,
-  `tests/test_loop_protection.py`, `tests/test_response_header_logging.py`
+- Test: `tests/test_upstream_reaches_socket.py`, `tests/test_server_upstream.py`,
+  `tests/test_dead_upstream.py`, `tests/test_summarizer_follows.py`,
+  `tests/test_loop_protection.py`, `tests/test_response_header_logging.py`,
+  `tests/test_health_chain_fields.py`, `tests/test_upstream_drift.py`
 
 **Interfaces:**
 - Consumes: `chain.is_self`, `chain.read_settings` (Tasks 2–3).
@@ -1404,10 +1455,14 @@ Run: python3 -m unittest discover -s tests
 import http.server
 import json
 import os
+import sys
 import tempfile
 import threading
 import unittest
 from unittest import mock
+
+# Every test file in this repo inserts proxy/ before importing server -- see tests/_fakes.py:25.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "proxy"))
 
 import server
 
@@ -1550,9 +1605,9 @@ def current_upstream():
         parsed = urlparse("https://api.anthropic.com")
     # D18: a file-sourced upstream must be loopback. An exported variable is the user acting
     # deliberately in their own shell and is exempt.
-    if not from_env and parsed.hostname not in (None, "api.anthropic.com") \
-            and not chain.host_matches(parsed.hostname, "127.0.0.1") \
-            and parsed.hostname != "api.anthropic.com":
+    if not from_env and parsed.hostname is not None \
+            and parsed.hostname != "api.anthropic.com" \
+            and not chain.host_matches(parsed.hostname, "127.0.0.1"):
         raise UpstreamRefused(raw, chain.user_settings_path())
 
     value = Upstream(parsed.scheme,
@@ -1593,6 +1648,123 @@ def test_explicit_override_still_wins(self):
         self.assertEqual(compressor.summarizer_endpoint().port, 7777)
 ```
 
+- [ ] **Step 4b: Turn refusals and dead upstreams into the documented error body**
+
+  `UpstreamRefused` and a connection-level failure must both reach the client as the D9
+  Anthropic-shaped body, not as an unhandled exception in `BaseHTTPRequestHandler`. Wrap the forward
+  path where the outbound connection is made and where `current_upstream()` is called:
+
+```python
+def _api_error(message):
+    return json.dumps({"type": "error",
+                       "error": {"type": "api_error", "message": message}}).encode()
+
+
+def _upstream_error_body(exc):
+    """D9: Claude Code renders this as a message rather than a transport crash."""
+    resolved = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if isinstance(exc, UpstreamRefused):
+        return _api_error(
+            f"rolling-context: refusing to use chained upstream {exc.url} from {exc.path} — "
+            f"it is not a loopback address, and forwarding there would send your API key "
+            f"off-machine. Fix or remove that value.")
+    up = _UPSTREAM_CACHE.get("value")
+    where = f"{up.scheme}://{up.host}:{up.port}" if up else "the chained upstream"
+    if os.environ.get("ROLLING_CONTEXT_UPSTREAM"):
+        return _api_error(
+            f"rolling-context: chained upstream {where} is not answering. It comes from "
+            f"ROLLING_CONTEXT_UPSTREAM in this session's environment, so unchain cannot clear it — "
+            f"unset ROLLING_CONTEXT_UPSTREAM in your shell and restart the proxy.")
+    return _api_error(
+        f"rolling-context: chained upstream {where} is not answering. "
+        f"Run: bash {resolved}/hooks/chain.sh unchain")
+```
+
+  The message names the **shell** form deliberately: the model cannot answer while its own requests
+  are failing, so the escape hatch must not need a model round-trip. `<resolved>` comes from the
+  running server's own location, never a hardcoded path — the plugin may be a symlink.
+
+```python
+# tests/test_dead_upstream.py
+def test_connection_refused_returns_an_anthropic_shaped_body(self):
+    self._point_at(59999)          # nothing listening
+    handler = make_handler(b'{"model":"claude-opus-5","messages":[],"max_tokens":1}')
+    handler.do_POST()
+    body = json.loads(handler.wfile.getvalue().split(b"\r\n\r\n", 1)[1])
+    self.assertEqual(body["error"]["type"], "api_error")
+    self.assertIn("not answering", body["error"]["message"])
+
+def test_tier_one_wording_names_the_variable_not_unchain(self):
+    with mock.patch.dict(os.environ, {"ROLLING_CONTEXT_UPSTREAM": "http://127.0.0.1:59999"}):
+        handler = make_handler(b'{"model":"claude-opus-5","messages":[],"max_tokens":1}')
+        handler.do_POST()
+        body = json.loads(handler.wfile.getvalue().split(b"\r\n\r\n", 1)[1])
+        self.assertIn("ROLLING_CONTEXT_UPSTREAM", body["error"]["message"])
+        self.assertNotIn("chain.sh unchain", body["error"]["message"])
+
+def test_a_live_upstream_status_passes_through_untouched(self):
+    self._point_at(A)              # listener answering 200
+    handler = make_handler(b'{"model":"claude-opus-5","messages":[],"max_tokens":1}')
+    handler.do_POST()
+    self.assertIn(b"200", handler.wfile.getvalue().split(b"\r\n", 1)[0])
+
+# tests/test_server_upstream.py
+def test_non_loopback_at_tier_two_is_refused_and_names_the_file(self):
+    self._write_user_settings({"ROLLING_CONTEXT_UPSTREAM": "https://proxy.example.com"})
+    with self.assertRaises(server.UpstreamRefused) as ctx:
+        server.current_upstream()
+    self.assertEqual(ctx.exception.path, chain.user_settings_path())
+
+def test_the_same_value_at_tier_one_is_honoured(self):
+    with mock.patch.dict(os.environ,
+                         {"ROLLING_CONTEXT_UPSTREAM": "https://proxy.example.com"}):
+        self.assertEqual(server.current_upstream().host, "proxy.example.com")
+
+def test_cache_invalidates_on_mtime_change(self):
+    self._point_at(A)
+    self.assertEqual(server.current_upstream().port, A)
+    self._point_at(B)
+    self.assertEqual(server.current_upstream().port, B)
+
+def test_our_own_address_falls_through_to_the_default_api(self):
+    self._write_user_settings({"ROLLING_CONTEXT_UPSTREAM": f"http://127.0.0.1:{server.LISTEN_PORT}"})
+    self.assertEqual(server.current_upstream().host, "api.anthropic.com")
+```
+
+- [ ] **Step 4c: `/health` fields and drift detection**
+
+  `/health` gains `chained` and `upstream_reachable` beside the sanitized `upstream_url` and
+  `upstream_source`, so `status` reads them rather than duplicating probe logic. The URL is
+  re-serialized from the parsed `Upstream`, never echoed raw. `SessionStart` additionally compares
+  the live `ROLLING_CONTEXT_UPSTREAM` against `upstream.wrote` and alerts on drift (spec §8) — a
+  key that changed underneath us while `ANTHROPIC_BASE_URL` still points at us is invisible to the
+  displacement check.
+
+```python
+# tests/test_health_chain_fields.py
+def test_health_exposes_chained_and_reachable(self):
+    data = _health_json()
+    self.assertIn("chained", data)
+    self.assertIn("upstream_reachable", data)
+
+def test_health_url_is_reserialized_not_echoed(self):
+    self._write_user_settings({"ROLLING_CONTEXT_UPSTREAM": "http://127.0.0.1:8787/../x"})
+    self.assertNotIn("..", _health_json()["upstream_url"])
+
+# tests/test_upstream_drift.py
+def test_drift_alerts_while_we_are_still_in_the_path(self):
+    self._chain_through(FOREIGN)
+    self._write_user_settings({"ROLLING_CONTEXT_UPSTREAM": "http://127.0.0.1:9999"})
+    self.assertIn("changed outside", self._hook_stdout())
+
+def test_a_second_unrelated_drift_is_not_suppressed(self):
+    self._chain_through(FOREIGN)
+    self._write_user_settings({"ROLLING_CONTEXT_UPSTREAM": "http://127.0.0.1:9999"})
+    self._hook_stdout()
+    self._write_user_settings({"ROLLING_CONTEXT_UPSTREAM": "http://127.0.0.1:7777"})
+    self.assertIn("changed outside", self._hook_stdout())
+```
+
 - [ ] **Step 5: Loop protection and response-header filtering**
 
   Both are small and both are in spec §7. Every forwarded request carries
@@ -1629,7 +1801,9 @@ def test_a_different_chained_from_address_forwards_normally(self):
 
 - [ ] **Step 6: Run and verify it passes, then run everything**
 
-  Run: `python3 -m unittest tests.test_upstream_reaches_socket tests.test_summarizer_follows tests.test_loop_protection tests.test_response_header_logging -v`
+  Run: `python3 -m unittest tests.test_upstream_reaches_socket tests.test_server_upstream \
+    tests.test_dead_upstream tests.test_summarizer_follows tests.test_loop_protection \
+    tests.test_response_header_logging tests.test_health_chain_fields tests.test_upstream_drift -v`
   Expected: PASS — requests land on A then B, no restart.
   Run: `python3 -m unittest discover -s tests`
   Expected: the whole suite green, including the pre-existing compression tests.
@@ -1637,9 +1811,11 @@ def test_a_different_chained_from_address_forwards_normally(self):
 - [ ] **Step 7: Commit**
 
 ```bash
-git add proxy/server.py proxy/compressor.py tests/test_upstream_reaches_socket.py \
-        tests/test_summarizer_follows.py tests/test_loop_protection.py \
-        tests/test_response_header_logging.py
+git add proxy/server.py proxy/compressor.py hooks/start-proxy.sh \
+        tests/test_upstream_reaches_socket.py tests/test_server_upstream.py \
+        tests/test_dead_upstream.py tests/test_summarizer_follows.py \
+        tests/test_loop_protection.py tests/test_response_header_logging.py \
+        tests/test_health_chain_fields.py tests/test_upstream_drift.py
 git commit -m "fix(proxy): resolve upstream per request, not at import
 
 server.py:100 froze the upstream for the daemon's lifetime, so a live proxy
@@ -1817,8 +1993,28 @@ fi
   `additionalContext`, per spec section 8 — and every diagnostic line goes to stderr and
   `$HOME/.claude/rolling-context-hook.log`.
 
-  Apply the same three cases to `install.sh:59-66`. Neither file writes
+  Note the citation covers `:59-68`: the `else: print("already")` branch at `:67-68` is part of the
+  same guard and changes with it.
+
+  Apply the same three cases to `install.sh:59-68`. Neither file writes
   `ROLLING_CONTEXT_UPSTREAM` any more; `chain` does that, explicitly and recorded.
+
+- [ ] **Step 3b: Add the test seam both test files depend on**
+
+  `tests/test_hook_output.py` and `tests/test_install_seeding.py` run these scripts for real, and
+  without a seam every test run forks a background daemon and writes a PID file. Add an early exit to
+  both scripts, immediately after the guard block and before any daemon spawn:
+
+```bash
+# Test seam: run the detection and seeding logic, then stop before starting anything.
+if [ -n "${ROLLING_CONTEXT_NO_START:-}" ]; then
+    exit 0
+fi
+```
+
+  This is the one piece of production surface added for tests, and it is deliberate: the alternative
+  is a test suite that spawns real daemons on every run. It is a guard, not a code path — nothing
+  above it behaves differently.
 
 - [ ] **Step 4: Run and verify they pass**
 
