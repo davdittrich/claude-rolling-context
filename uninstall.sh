@@ -3,6 +3,13 @@
 
 set -e
 
+_SRC="$0"
+_DIR="${_SRC%/*}"
+[ "$_DIR" = "$_SRC" ] && _DIR="."
+SCRIPT_DIR="$(cd "$_DIR" && pwd)"
+PROXY_DIR="$SCRIPT_DIR/proxy"
+CHAIN="$SCRIPT_DIR/hooks/chain.sh"
+
 CLAUDE_DIR="$HOME/.claude"
 PIDFILE="$CLAUDE_DIR/rolling-context-proxy.pid"
 PLUGIN_LINK="$CLAUDE_DIR/plugins/rolling-context"
@@ -37,6 +44,66 @@ rm -f "$CLAUDE_DIR/rolling-context-proxy.log"
 rm -f "$CLAUDE_DIR/rolling-context-proxy.log.err"
 rm -f "$CLAUDE_DIR/rolling-context-debug.log"
 rm -f "$CLAUDE_DIR/rolling-context-hook.log"
+
+# Undo any project-scope ANTHROPIC_BASE_URL chain.py wrote, before the plugin directory
+# that holds chain.sh (below) is removed -- the tool that undoes the chain must still
+# exist on disk when it runs.
+if [ -x "$CHAIN" ]; then
+    "$CHAIN" unchain --all || echo "  WARNING: unchain --all failed; a project's ANTHROPIC_BASE_URL may still point at this proxy"
+fi
+rm -f "$CLAUDE_DIR/rolling-context-proxy.json"
+
+# Clean ANTHROPIC_BASE_URL from Claude Code settings.json
+SETTINGS_FILE="$CLAUDE_DIR/settings.json"
+if [ -f "$SETTINGS_FILE" ]; then
+    PY_CMD=""
+    if command -v python3 &>/dev/null; then PY_CMD="python3"
+    elif command -v python &>/dev/null; then PY_CMD="python"
+    fi
+    if [ -z "$PY_CMD" ]; then
+        echo "  SKIPPED: no python3/python found -- could not clean ANTHROPIC_BASE_URL from $SETTINGS_FILE"
+    fi
+    if [ -n "$PY_CMD" ]; then
+        $PY_CMD - "$SETTINGS_FILE" "$PROXY_DIR" <<'PYEOF'
+import json, sys, os
+
+settings_file, proxy_dir = sys.argv[1], sys.argv[2]
+sys.path.insert(0, proxy_dir)
+import chain
+
+try:
+    with open(settings_file, "r") as f:
+        settings = json.load(f)
+except (json.JSONDecodeError, IOError):
+    sys.exit(0)
+
+env = settings.get("env", {})
+current = env.get("ANTHROPIC_BASE_URL", "")
+upstream = env.get("ROLLING_CONTEXT_UPSTREAM", "")
+
+if current and chain.is_self(current):
+    if upstream:
+        env["ANTHROPIC_BASE_URL"] = upstream
+        del env["ROLLING_CONTEXT_UPSTREAM"]
+        print(f"Restored ANTHROPIC_BASE_URL to {upstream}")
+    else:
+        del env["ANTHROPIC_BASE_URL"]
+        print("Removed ANTHROPIC_BASE_URL")
+elif "ROLLING_CONTEXT_UPSTREAM" in env:
+    del env["ROLLING_CONTEXT_UPSTREAM"]
+
+# Remove plugin config vars
+for key in list(env.keys()):
+    if key.startswith("ROLLING_CONTEXT_"):
+        del env[key]
+
+settings["env"] = env
+with open(settings_file, "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+PYEOF
+    fi
+fi
 
 # Remove plugin link (manual install)
 if [ -L "$PLUGIN_LINK" ] || [ -d "$PLUGIN_LINK" ]; then
@@ -86,51 +153,6 @@ if 'rolling-context-marketplace' in data:
 "
 fi
 
-# Clean ANTHROPIC_BASE_URL from Claude Code settings.json
-SETTINGS_FILE="$CLAUDE_DIR/settings.json"
-if [ -f "$SETTINGS_FILE" ]; then
-    PY_CMD=""
-    if command -v python3 &>/dev/null; then PY_CMD="python3"
-    elif command -v python &>/dev/null; then PY_CMD="python"
-    fi
-    if [ -n "$PY_CMD" ]; then
-        $PY_CMD - "$SETTINGS_FILE" <<'PYEOF'
-import json, sys, os
-
-settings_file = sys.argv[1]
-try:
-    with open(settings_file, "r") as f:
-        settings = json.load(f)
-except (json.JSONDecodeError, IOError):
-    sys.exit(0)
-
-env = settings.get("env", {})
-current = env.get("ANTHROPIC_BASE_URL", "")
-upstream = env.get("ROLLING_CONTEXT_UPSTREAM", "")
-
-if current and "127.0.0.1" in current:
-    if upstream:
-        env["ANTHROPIC_BASE_URL"] = upstream
-        del env["ROLLING_CONTEXT_UPSTREAM"]
-        print(f"Restored ANTHROPIC_BASE_URL to {upstream}")
-    else:
-        del env["ANTHROPIC_BASE_URL"]
-        print("Removed ANTHROPIC_BASE_URL")
-elif "ROLLING_CONTEXT_UPSTREAM" in env:
-    del env["ROLLING_CONTEXT_UPSTREAM"]
-
-# Remove plugin config vars
-for key in list(env.keys()):
-    if key.startswith("ROLLING_CONTEXT_"):
-        del env[key]
-
-settings["env"] = env
-with open(settings_file, "w") as f:
-    json.dump(settings, f, indent=2)
-    f.write("\n")
-PYEOF
-    fi
-fi
 
 echo ""
 echo "Uninstalled."

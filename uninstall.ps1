@@ -4,6 +4,10 @@
 
 $ErrorActionPreference = "SilentlyContinue"
 
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ProxyDir = Join-Path $ScriptDir "proxy"
+$ChainPy = Join-Path $ProxyDir "chain.py"
+
 $ClaudeDir = Join-Path $env:USERPROFILE ".claude"
 $PidFile = Join-Path $ClaudeDir "rolling-context-proxy.pid"
 $PluginLink = Join-Path $ClaudeDir "plugins\rolling-context"
@@ -41,6 +45,17 @@ Remove-Item (Join-Path $ClaudeDir "rolling-context-proxy.log") -Force -ErrorActi
 Remove-Item (Join-Path $ClaudeDir "rolling-context-proxy.log.err") -Force -ErrorAction SilentlyContinue
 Remove-Item (Join-Path $ClaudeDir "rolling-context-debug.log") -Force -ErrorAction SilentlyContinue
 Remove-Item (Join-Path $ClaudeDir "rolling-context-hook.log") -Force -ErrorAction SilentlyContinue
+
+# Undo any project-scope ANTHROPIC_BASE_URL chain.py wrote, before the plugin directory
+# that holds chain.py (below) is removed -- the tool that undoes the chain must still
+# exist on disk when it runs.
+if (Test-Path $ChainPy) {
+    python $ChainPy unchain --all
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  WARNING: unchain --all failed; a project's ANTHROPIC_BASE_URL may still point at this proxy"
+    }
+}
+Remove-Item (Join-Path $ClaudeDir "rolling-context-proxy.json") -Force -ErrorAction SilentlyContinue
 
 # Remove plugin link (manual install)
 if (Test-Path $PluginLink) {
@@ -98,7 +113,7 @@ if (Test-Path $SettingsFile) {
                 $upstream = $settings.env.ROLLING_CONTEXT_UPSTREAM
             }
 
-            if ($existingUrl -and $existingUrl -match "127\.0\.0\.1") {
+            if ($existingUrl -and $existingUrl -match "127\.0\.0\.1.*$Port") {
                 if ($upstream) {
                     $settings.env.ANTHROPIC_BASE_URL = $upstream
                     $settings.env.PSObject.Properties.Remove("ROLLING_CONTEXT_UPSTREAM")
