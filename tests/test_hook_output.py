@@ -182,6 +182,18 @@ class HookOutputTest(unittest.TestCase):
         self._displace()
         self.assertIn("8787", self._run().stdout)
 
+    def test_an_unwritable_state_dir_does_not_silence_the_alert(self):
+        """D8 suppression is ergonomics; silence is the bug this feature removes.
+
+        When the state file cannot be written we lose only the memory of having
+        alerted, so the alert repeats next session. Losing the alert itself is
+        the failure mode the whole feature exists to prevent.
+        """
+        self._displace()
+        os.chmod(os.path.join(self.home, ".claude"), 0o500)
+        self.addCleanup(os.chmod, os.path.join(self.home, ".claude"), 0o700)
+        out = self._run().stdout
+        self.assertIn("8787", out)
 
 if __name__ == "__main__":
     unittest.main()

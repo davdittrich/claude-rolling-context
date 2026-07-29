@@ -331,7 +331,11 @@ def _record_alert(state, project, key):
     if (project, key) in seen:
         return False
     state.setdefault("alerted", []).append({"project": project, "url": key})
-    save_state(state)
+    # Fail open: if we cannot remember having alerted, still alert. The cost is
+    # a repeat next session; the cost of failing closed is silence, which is the
+    # failure this whole feature exists to remove.
+    with contextlib.suppress(OSError):
+        save_state(state)
     return True
 
 
