@@ -178,7 +178,7 @@ def current_upstream() -> Upstream:
             from_file = True
         else:
             candidate = env.get("ANTHROPIC_BASE_URL")
-            if candidate and not chain.is_self(candidate):
+            if candidate:
                 raw = candidate
                 from_file = True
 
