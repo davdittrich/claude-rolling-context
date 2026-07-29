@@ -65,7 +65,8 @@ class _FlattenedReplyGuardTestBase(unittest.TestCase):
         # Any format other than the (implicit) native default must set a
         # summarizer URL/key/model to actually exercise flattened mode's
         # module constants consistently; _summarize_flattened itself does
-        # not gate on NATIVE_MODE, so this is just realism, not a dependency.
+        # not gate on native_mode() (computed fresh per call), so this is just
+        # realism, not a dependency.
         os.environ["ROLLING_CONTEXT_SUMMARIZER_URL"] = "http://localhost:9"
         importlib.reload(compressor)
         self._real_conn_fn = compressor._summarizer_conn

@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.4.0
+
+Five bug fixes, all found by mutation testing and adversarial review of the 2.3.0 work.
+
+### Fixed
+
+- A malformed `ROLLING_CONTEXT_UPSTREAM` no longer kills the proxy. `current_upstream()` parsed
+  URLs unguarded, so a non-numeric port, an out-of-range port, or a malformed IPv6 literal raised
+  `ValueError` out of both `/health` and startup — the daemon died before binding its socket.
+  It now degrades through the same refusal path as every other bad upstream, and `/health` reports
+  the problem instead of returning a traceback.
+- The displacement alert no longer goes silent when it cannot write its state file. On a read-only
+  `$HOME` the alert was lost entirely; it now fires and simply repeats next session.
+- Native mode is resolved per request instead of being captured at import. The daemon is long-lived
+  and gets reused, so the old flag outlived the configuration it described.
+- Removed a redundant self-pointer guard in `current_upstream()`. The following block already
+  produced its outcome, so it was unreachable in effect.
+
+### Testing
+
+- Both `is_self()` parse-failure branches are now covered; the originally reported CRLF trigger
+  does not reach them, because Python strips `\r` and `\n` from URLs.
+- `/health`'s `chained` field is pinned in both directions — the previous tests only ever observed
+  one side, so the comparison could be inverted without any test noticing.
+- The suite is hermetic against all six documented `ROLLING_CONTEXT_*` and `ANTHROPIC_BASE_URL`
+  variables. Exporting any one of them used to turn six unrelated tests red.
+- Three test files that could only run as part of the full suite now run standalone.
+
 ## 2.3.0
 
 Fixes three defects around a proxy displacing Rolling Context from the request path:

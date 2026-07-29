@@ -34,7 +34,7 @@ class CommandsExistTest(unittest.TestCase):
     def test_version_was_bumped(self):
         import json
         with open(os.path.join(REPO, ".claude-plugin", "plugin.json"), encoding="utf-8") as f:
-            self.assertEqual(json.load(f)["version"], "2.3.0")
+            self.assertEqual(json.load(f)["version"], "2.4.0")
 
 
 if __name__ == "__main__":

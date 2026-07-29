@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import chain
 import server
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _fakes import hermetic_home, write_user_settings
 
 
@@ -50,6 +51,19 @@ class ServerUpstreamTest(unittest.TestCase):
         _, our_port = chain.our_bind()
         self._write_user_settings(
             {"ROLLING_CONTEXT_UPSTREAM": f"http://127.0.0.1:{our_port}"})
+        self.assertEqual(server.current_upstream().host, "api.anthropic.com")
+
+    def test_a_self_pointing_anthropic_base_url_falls_through_to_the_default_api(self):
+        """A self-pointing ANTHROPIC_BASE_URL in the user settings file must
+        resolve to the default upstream, not to itself. The guard this
+        replaces (`if candidate and not chain.is_self(candidate):`) used to
+        stop this candidate from ever reaching `raw`; now the downstream
+        recheck (`if from_file and chain.is_self(raw):`) alone resets it to
+        the default -- this is the behavioural proof that deletion is safe.
+        """
+        _, our_port = chain.our_bind()
+        self._write_user_settings(
+            {"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{our_port}"})
         self.assertEqual(server.current_upstream().host, "api.anthropic.com")
 
     def test_non_loopback_at_tier_two_is_refused_and_names_the_file(self):

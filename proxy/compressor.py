@@ -36,7 +36,6 @@ from urllib.parse import urlparse
 
 log = logging.getLogger("rolling-context.compressor")
 
-SUMMARIZER_URL_SET = bool(os.environ.get("ROLLING_CONTEXT_SUMMARIZER_URL"))
 SUMMARIZER_API_KEY = os.environ.get("ROLLING_CONTEXT_SUMMARIZER_KEY") or ""
 # "anthropic" (default) or "openai" — openai speaks /v1/chat/completions
 SUMMARIZER_FORMAT = (os.environ.get("ROLLING_CONTEXT_SUMMARIZER_FORMAT") or "anthropic").lower()
@@ -46,8 +45,14 @@ SUMMARIZER_FORMAT = (os.environ.get("ROLLING_CONTEXT_SUMMARIZER_FORMAT") or "ant
 # different model guarantees a cache MISS, so treat it the same as a custom
 # summarizer and fall back to a standalone flattened request.
 SUMMARIZER_MODEL = os.environ.get("ROLLING_CONTEXT_MODEL") or ""
-MODEL_SET = bool(SUMMARIZER_MODEL)
-NATIVE_MODE = not (SUMMARIZER_URL_SET or SUMMARIZER_API_KEY or SUMMARIZER_FORMAT != "anthropic" or MODEL_SET)
+def native_mode():
+    """True when the cloned-session-request path is usable, computed fresh."""
+    return not (
+        os.environ.get("ROLLING_CONTEXT_SUMMARIZER_URL")
+        or os.environ.get("ROLLING_CONTEXT_SUMMARIZER_KEY")
+        or (os.environ.get("ROLLING_CONTEXT_SUMMARIZER_FORMAT") or "anthropic").lower() != "anthropic"
+        or os.environ.get("ROLLING_CONTEXT_MODEL")
+    )
 LEGACY_DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 
 ssl_ctx = ssl.create_default_context()
@@ -194,7 +199,8 @@ class RollingCompressor:
         self.target_tokens = target_tokens
         # Only used by flattened mode: native mode always uses the session's
         # own payload["model"] (that's what makes it a prompt-cache hit).
-        # Setting ROLLING_CONTEXT_MODEL switches NATIVE_MODE off, so
+        # Setting ROLLING_CONTEXT_MODEL makes native_mode() (computed fresh each
+        # call) return False, so
         # summarizer_model and native mode are mutually exclusive by design.
         self.summarizer_model = summarizer_model
         # Blend keep policy: keep between keep_floor and keep_turns recent
@@ -709,7 +715,7 @@ class RollingCompressor:
 
         recent_messages = messages[keep_from_idx:]
 
-        use_native = NATIVE_MODE and payload is not None
+        use_native = native_mode() and payload is not None
         if use_native:
             new_summary = self._summarize_native(payload, messages, keep_from_idx, auth_headers)
         else:

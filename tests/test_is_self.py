@@ -51,6 +51,20 @@ class IsSelfTest(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertFalse(chain.is_self(bad))
 
+    def test_unparseable_urls_are_not_us(self):
+        """Both parse-failure arms; \r and \n do NOT reach them (Python's
+        urlparse() strips them), so these use inputs that genuinely fail
+        to parse.
+        """
+        for value in (
+            "http://[::1",             # urlparse() raises: Invalid IPv6 URL
+            "http://127.0.0.1:abc",    # .port raises: not an integer
+            "http://127.0.0.1:99999",  # .port raises: out of range
+            "http://127.0.0.1: 5588",  # .port raises: not an integer
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(chain.is_self(value))
+
 
 if __name__ == "__main__":
     unittest.main()

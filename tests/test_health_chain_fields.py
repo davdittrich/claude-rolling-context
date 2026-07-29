@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import chain
 import server
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _fakes import hermetic_home, write_user_settings
 
 
@@ -95,6 +96,13 @@ class HealthChainFieldsTest(unittest.TestCase):
         self.assertEqual(data["upstream_source"], chain.user_settings_path())
         self.assertTrue(data["chained"])
         self.assertFalse(data["upstream_reachable"])
+
+    def test_chained_is_false_for_the_default_api_and_true_for_a_local_upstream(self):
+        """Both directions in one assertion: checking only one side lets the
+        `!=` polarity in _handle_health flip to `==` and still pass."""
+        self.assertFalse(_health_json()["chained"])
+        self._write_user_settings({"ROLLING_CONTEXT_UPSTREAM": "http://127.0.0.1:8787"})
+        self.assertTrue(_health_json()["chained"])
 
 
 if __name__ == "__main__":
