@@ -152,6 +152,9 @@ def hermetic_home(testcase):
     os.environ.pop("ROLLING_CONTEXT_UPSTREAM", None)
     os.environ.pop("ROLLING_CONTEXT_PORT", None)
     os.environ.pop("ROLLING_CONTEXT_SUMMARIZER_URL", None)
+    os.environ.pop("ROLLING_CONTEXT_SUMMARIZER_KEY", None)
+    os.environ.pop("ROLLING_CONTEXT_SUMMARIZER_FORMAT", None)
+    os.environ.pop("ROLLING_CONTEXT_MODEL", None)
     testcase.addCleanup(patch.stop)
     return home
 
