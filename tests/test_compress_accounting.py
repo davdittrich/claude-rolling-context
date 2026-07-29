@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "proxy"))
 import compressor  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _fakes import FakeSummarizerConn  # noqa: E402
+from _fakes import FakeSummarizerConn, hermetic_home  # noqa: E402
 
 
 def _build_messages():
@@ -48,6 +48,7 @@ def _build_messages():
 
 class CompressAccountingTest(unittest.TestCase):
     def setUp(self):
+        hermetic_home(self)
         self._real_conn_fn = compressor._summarizer_conn
         self._fake_conn = FakeSummarizerConn(reply_text="mocked deterministic summary text.")
         compressor._summarizer_conn = lambda ep, timeout=600: self._fake_conn

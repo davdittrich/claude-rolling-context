@@ -17,7 +17,7 @@ import compressor  # noqa: E402
 import server  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _fakes import FakeSummarizerConn, make_handler  # noqa: E402
+from _fakes import FakeSummarizerConn, hermetic_home, make_handler  # noqa: E402
 
 import json  # noqa: E402
 
@@ -45,6 +45,7 @@ def _health_json():
 
 class LastCompressionTest(unittest.TestCase):
     def setUp(self):
+        hermetic_home(self)
         self._real = compressor._summarizer_conn
         compressor._summarizer_conn = lambda ep, timeout=600: FakeSummarizerConn(
             reply_text="mocked deterministic summary text.")
