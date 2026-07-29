@@ -1,7 +1,8 @@
 """Tests for Strategy A: ROLLING_CONTEXT_MODEL forces flattened mode.
 
 Invariants proven here:
-- Setting ROLLING_CONTEXT_MODEL switches NATIVE_MODE off (a pinned summarizer
+- Setting ROLLING_CONTEXT_MODEL makes native_mode() (computed fresh per call)
+  return False (a pinned summarizer
   model means the user wants a foreign model, so the cloned-session-request
   trick can't produce a prompt-cache hit anyway -> use flattened instead).
 - Leaving ROLLING_CONTEXT_MODEL unset keeps native mode on.
@@ -136,6 +137,7 @@ class SingleSourceModelTest(unittest.TestCase):
         self.assertEqual(srv.SUMMARIZER_MODEL, comp.SUMMARIZER_MODEL)
         self.assertEqual(srv.compressor.summarizer_model, comp.SUMMARIZER_MODEL)
         self.assertFalse(comp.native_mode())
+        self.assertIs(srv.native_mode, comp.native_mode)
 
     def test_server_and_compressor_agree_when_model_unset(self):
         comp, srv = self._reload_both()
@@ -143,6 +145,7 @@ class SingleSourceModelTest(unittest.TestCase):
         self.assertEqual(srv.SUMMARIZER_MODEL, comp.SUMMARIZER_MODEL)
         self.assertEqual(srv.compressor.summarizer_model, comp.SUMMARIZER_MODEL)
         self.assertTrue(comp.native_mode())
+        self.assertIs(srv.native_mode, comp.native_mode)
 
     def test_only_compressor_reads_the_env_var(self):
         # Code-structure guard for the DoD: both occurrences of

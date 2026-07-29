@@ -8,10 +8,16 @@ Run: python3 -m unittest discover -s tests
 """
 import json
 import os
+import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import urllib.error
+import urllib.request
+from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "proxy"))
@@ -19,6 +25,7 @@ sys.path.insert(0, os.path.join(REPO, "proxy"))
 import chain  # noqa: E402
 import server  # noqa: E402
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _fakes import hermetic_home  # noqa: E402
 
 MALFORMED = [
@@ -26,6 +33,14 @@ MALFORMED = [
     "http://[::1",
     "http://127.0.0.1:99999",
 ]
+
+
+def _free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
 
 
 class MalformedUpstreamTest(unittest.TestCase):
@@ -50,6 +65,19 @@ class MalformedUpstreamTest(unittest.TestCase):
                     server.current_upstream()
                 self.assertEqual(caught.exception.reason, "malformed")
 
+    def test_a_malformed_upstream_in_the_environment_is_also_refused(self):
+        # The originating bug report named ROLLING_CONTEXT_UPSTREAM exported
+        # in the process environment, not just a settings-file value -- cover
+        # that literal trigger, not only its settings-file analogue above.
+        for value in MALFORMED:
+            with self.subTest(value=value):
+                server._UPSTREAM_CACHE.update(stamp=None, value=None)
+                with mock.patch.dict(os.environ, {"ROLLING_CONTEXT_UPSTREAM": value}):
+                    with self.assertRaises(server.UpstreamRefused) as caught:
+                        server.current_upstream()
+                self.assertEqual(caught.exception.reason, "malformed")
+                self.assertEqual(caught.exception.path, "<environment>")
+
     def test_the_error_body_names_the_malformed_value(self):
         self._write_upstream("http://127.0.0.1:abc")
         try:
@@ -61,27 +89,43 @@ class MalformedUpstreamTest(unittest.TestCase):
 
     def test_the_daemon_still_binds_with_a_malformed_upstream(self):
         home = tempfile.mkdtemp(prefix="malformed-daemon-")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
         os.makedirs(os.path.join(home, ".claude"), exist_ok=True)
         with open(os.path.join(home, ".claude", "settings.json"), "w", encoding="utf-8") as f:
             json.dump({"env": {"ROLLING_CONTEXT_UPSTREAM": "http://127.0.0.1:abc"}}, f)
-        env = dict(os.environ, HOME=home, ROLLING_CONTEXT_PORT="5607")
+        port = _free_port()
+        env = dict(os.environ, HOME=home, ROLLING_CONTEXT_PORT=str(port))
         for key in ("ANTHROPIC_BASE_URL", "ROLLING_CONTEXT_UPSTREAM",
                     "ROLLING_CONTEXT_SUMMARIZER_URL"):
             env.pop(key, None)
         proc = subprocess.Popen([sys.executable, os.path.join(REPO, "proxy", "server.py")],
                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(proc.kill)
+        # A daemon that degrades correctly never exits on its own -- it logs a
+        # warning and binds its socket. Bind-then-probe against /health is the
+        # positive signal that it actually came up, not merely that it failed
+        # to crash for some other reason (which is all the old stderr-only
+        # check could tell apart).
+        bound = False
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and proc.poll() is None:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as resp:
+                    bound = resp.status == 200
+                break
+            except (urllib.error.URLError, ConnectionError):
+                time.sleep(0.1)
+        proc.terminate()
         try:
-            # A daemon that degrades correctly never exits on its own -- it logs
-            # a warning and calls serve_forever(). Still running after a few
-            # seconds *is* the passing signal: it bound its socket instead of
-            # dying. Only an early exit needs its stderr inspected.
-            _, err = proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.terminate()
             _, err = proc.communicate(timeout=10)
-        # It must not die on a traceback. It may exit for any other reason.
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _, err = proc.communicate(timeout=10)
+        # It must not die on a traceback, and it must have actually bound and
+        # served /health -- not merely exited early for some other reason.
         self.assertNotIn("ValueError", err)
         self.assertNotIn("Traceback", err)
+        self.assertTrue(bound, f"daemon never served /health; stderr:\n{err}")
 
 
 if __name__ == "__main__":

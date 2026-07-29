@@ -199,7 +199,8 @@ class RollingCompressor:
         self.target_tokens = target_tokens
         # Only used by flattened mode: native mode always uses the session's
         # own payload["model"] (that's what makes it a prompt-cache hit).
-        # Setting ROLLING_CONTEXT_MODEL switches NATIVE_MODE off, so
+        # Setting ROLLING_CONTEXT_MODEL makes native_mode() (computed fresh each
+        # call) return False, so
         # summarizer_model and native mode are mutually exclusive by design.
         self.summarizer_model = summarizer_model
         # Blend keep policy: keep between keep_floor and keep_turns recent
