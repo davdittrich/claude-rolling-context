@@ -285,6 +285,11 @@ target drifts underneath you.
 None of this needs a restart: the proxy resolves its upstream fresh on every request, so `chain`,
 `unchain`, or hand-editing `ROLLING_CONTEXT_UPSTREAM` all take effect on the very next request.
 
+The alert is deliberately hard to silence. If Rolling Context cannot write its state file — a
+read-only `$HOME`, for instance — it still alerts, and simply repeats the alert next session
+instead of remembering it has already told you. Losing the record is cheap; losing the alert
+is the failure this whole mechanism exists to prevent.
+
 You can also set the upstream explicitly, bypassing the alert entirely:
 ```bash
 export ROLLING_CONTEXT_UPSTREAM=http://localhost:8080  # your existing proxy
@@ -306,6 +311,10 @@ Returns compression stats and runtime info. Fields include:
 - `upstream_source` — where `upstream_url` came from: the path of your user settings file when that set it, `<environment>` when your shell exported it, or `(default)` when nothing set it and requests go straight to the API.
 - `chained` — `true` unless the resolved upstream is the default `api.anthropic.com` (i.e. Rolling Context is forwarding through another proxy).
 - `upstream_reachable` — `true` if a fast TCP probe to the upstream host:port succeeded.
+- `upstream_url` reads `(unresolved: ...)` and `upstream_reachable` is `false` when the configured
+  upstream cannot be parsed or its settings file is not valid JSON. The proxy keeps serving and
+  reports the problem here rather than refusing to start — a malformed value is a diagnosis, not a
+  crash.
 
 ## Debug
 
