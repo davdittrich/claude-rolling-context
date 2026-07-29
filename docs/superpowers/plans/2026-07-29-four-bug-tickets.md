@@ -398,7 +398,19 @@ them."
 - Modify: `tests/test_health_chain_fields.py` (add one test)
 - Modify: `tests/test_server_upstream.py` (add one test)
 
-**Interfaces:** No source changes. This task adds assertions only.
+**Interfaces:** One source deletion (see the correction below) plus assertions.
+
+**CORRECTION, made during execution.** This task was scoped as tests-only on the assumption that
+both surviving mutations pinned real behaviour. The `chained` polarity does. The self-guard does
+not: `if candidate and not chain.is_self(candidate)` is redundant, because the very next block,
+`if from_file and chain.is_self(raw)`, already sends a self-pointer to the default. Verified by
+deleting the sub-expression and running the suite — `1 failed, 238 passed`, and the single failure
+was the new spy test, not any behavioural test.
+
+Dead code cannot be constrained by a behavioural assertion, and the only test that can kill the
+mutation is one that spies on `chain.is_self`'s call count — an internal-call assertion that
+breaks on any non-behavioural refactor. So the resolution is deletion, not a test: remove the
+redundant `and not chain.is_self(candidate)`, and drop the spy test with it.
 
 **Why:** Both mutations leave the suite fully green on master, so nothing pins either behaviour:
 
